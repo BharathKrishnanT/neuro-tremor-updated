@@ -1,0 +1,114 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-display: "Plus Jakarta Sans", "IBM Plex Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-sans: "IBM Plex Sans", "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: "IBM Plex Mono", SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Clinical Engineering Layout & Global Typography */
+:root {
+  --bg-main: #f8fafc;
+  --bg-surface: #ffffff;
+  --bg-surface-subtle: #f1f5f9;
+  --border-color: #e2e8f0;
+  --border-strong: #cbd5e1;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+  --text-faint: #94a3b8;
+  --accent-clinical: #0284c7;
+  --accent-teal: #0d9488;
+}
+
+.dark {
+  --bg-main: #090d16;
+  --bg-surface: #0f172a;
+  --bg-surface-subtle: #162032;
+  --border-color: #1e293b;
+  --border-strong: #334155;
+  --text-primary: #f8fafc;
+  --text-secondary: #cbd5e1;
+  --text-muted: #94a3b8;
+  --text-faint: #64748b;
+  --accent-clinical: #38bdf8;
+  --accent-teal: #2dd4bf;
+}
+
+html {
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  background-color: var(--bg-main);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  min-height: 100vh;
+}
+
+h1, h2, h3, .font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle Technical Grid Background for Engineering Aesthetic */
+.bg-tech-grid {
+  background-size: 24px 24px;
+  background-image: 
+    linear-gradient(to right, rgba(148, 163, 184, 0.08) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(148, 163, 184, 0.08) 1px, transparent 1px);
+}
+
+.dark .bg-tech-grid {
+  background-image: 
+    linear-gradient(to right, rgba(51, 65, 85, 0.25) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(51, 65, 85, 0.25) 1px, transparent 1px);
+}
+
+/* Clean Custom Scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+.dark .custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #334155;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+.dark .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* Recharts Clinical Customization */
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  stroke-opacity: 0.8;
+}
+
+.recharts-text.recharts-cartesian-axis-tick-value {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+/* Focus Ring Standardization */
+button:focus-visible, 
+input:focus-visible, 
+select:focus-visible, 
+textarea:focus-visible {
+  outline: 2px solid #0284c7;
+  outline-offset: 1px;
+}

@@ -1,0 +1,68 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 100 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isDocOwner() {
+      return isSignedIn() && existing().userId == request.auth.uid;
+    }
+
+    function isValidSession(data) {
+      return data.keys().hasAll(['id', 'userId', 'timestamp', 'duration', 'severity', 'stage', 'rms', 'frequency', 'data']) &&
+             data.keys().hasOnly([
+               'id', 'userId', 'timestamp', 'duration', 'severity', 'stage', 'rms', 'frequency', 'data',
+               'phenotype', 'pdProbability', 'etProbability', 'pillRollingIndex', 'avgForce', 'integrityHash'
+             ]) &&
+             isValidId(data.id) &&
+             data.userId is string && data.userId == request.auth.uid && data.userId.size() <= 100 &&
+             data.timestamp is number && data.timestamp > 0 &&
+             data.duration is number && data.duration >= 0 &&
+             data.severity is string && data.severity.size() > 0 && data.severity.size() <= 50 &&
+             data.stage is string && data.stage.size() > 0 && data.stage.size() <= 50 &&
+             data.rms is number && data.rms >= 0 &&
+             data.frequency is number && data.frequency >= 0 &&
+             data.data is string && data.data.size() <= 1048576 &&
+             (!('phenotype' in data) || (data.phenotype is string && data.phenotype.size() <= 80)) &&
+             (!('pdProbability' in data) || (data.pdProbability is number && data.pdProbability >= 0 && data.pdProbability <= 100)) &&
+             (!('etProbability' in data) || (data.etProbability is number && data.etProbability >= 0 && data.etProbability <= 100)) &&
+             (!('pillRollingIndex' in data) || (data.pillRollingIndex is number && data.pillRollingIndex >= 0 && data.pillRollingIndex <= 100)) &&
+             (!('avgForce' in data) || (data.avgForce is number && data.avgForce >= 0)) &&
+             (!('integrityHash' in data) || (data.integrityHash is string && data.integrityHash.size() <= 64));
+    }
+
+    match /test/connection {
+      allow get: if true;
+    }
+
+    match /sessions/{sessionId} {
+      allow get: if isValidId(sessionId) && isDocOwner();
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(sessionId) && sessionId == incoming().id && isValidSession(incoming());
+      allow update: if isSignedIn() && isValidId(sessionId) && isDocOwner() && isValidSession(incoming()) &&
+                    incoming().id == existing().id &&
+                    incoming().userId == existing().userId &&
+                    incoming().timestamp == existing().timestamp;
+      allow delete: if isValidId(sessionId) && isDocOwner();
+    }
+  }
+}

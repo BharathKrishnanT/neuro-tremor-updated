@@ -1,0 +1,6 @@
+{
+  "name": "NeuroTremor",
+  "description": "Quantitative clinical tremor evaluation platform differentiating Parkinsonian resting tremor and Essential postural tremor using IMU and FSR grip telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

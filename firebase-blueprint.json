@@ -1,0 +1,89 @@
+{
+  "entities": {
+    "Session": {
+      "title": "Session",
+      "description": "A recorded clinical tremor and grip pressure assessment session with differential phenotype analysis.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for the session.",
+          "maxLength": 100,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "description": "The ID of the user who recorded the session.",
+          "maxLength": 100,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "The start time of the session (Unix timestamp)."
+        },
+        "duration": {
+          "type": "number",
+          "description": "The duration of the session in seconds."
+        },
+        "severity": {
+          "type": "string",
+          "description": "The calculated severity level (Normal, Mild, Moderate, Severe).",
+          "maxLength": 50
+        },
+        "stage": {
+          "type": "string",
+          "description": "The calculated clinical stage.",
+          "maxLength": 50
+        },
+        "rms": {
+          "type": "number",
+          "description": "The Root Mean Square value of the tremor."
+        },
+        "frequency": {
+          "type": "number",
+          "description": "The dominant frequency of the tremor in Hz."
+        },
+        "phenotype": {
+          "type": "string",
+          "description": "Differential classification (e.g., Parkinsonian Tremor (PD), Essential / Postural Tremor (ET)).",
+          "maxLength": 80
+        },
+        "pdProbability": {
+          "type": "number",
+          "description": "Probability score (0-100) for Parkinsonian resting tremor."
+        },
+        "etProbability": {
+          "type": "number",
+          "description": "Probability score (0-100) for Essential / postural tremor."
+        },
+        "pillRollingIndex": {
+          "type": "number",
+          "description": "Pronation-supination rotational dominance index (0-100)."
+        },
+        "avgForce": {
+          "type": "number",
+          "description": "Mean isometric grip force from FSR sensor."
+        },
+        "integrityHash": {
+          "type": "string",
+          "description": "Server-generated HMAC-SHA256 integrity digest for clinical auditability.",
+          "maxLength": 64
+        },
+        "data": {
+          "type": "string",
+          "description": "Downsampled JSON telemetry array.",
+          "maxLength": 1048576
+        }
+      },
+      "required": ["id", "userId", "timestamp", "duration", "severity", "stage", "rms", "frequency", "data"]
+    }
+  },
+  "firestore": {
+    "/sessions/{sessionId}": {
+      "schema": {
+        "$ref": "#/entities/Session"
+      },
+      "description": "Stores recorded tremor assessment sessions for authenticated clinicians and patients."
+    }
+  }
+}
