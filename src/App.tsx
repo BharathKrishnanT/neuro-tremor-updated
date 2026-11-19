@@ -9,6 +9,11 @@ import {
   generateSimulatedSample,
   analyzeTremorDifferential,
   computeRecoveryAnalysis,
+  computeDatasetSectionSummary,
+  computeSensorChannelStats,
+  DifferentialAnalysisResult,
+  DatasetSectionSummary,
+  SensorChannelStats,
 } from './lib/tremorAnalyzer';
 import { verifyAndCompressSession } from './lib/backendApi';
 import { audioFeedback } from './lib/audio';
@@ -19,7 +24,12 @@ import { DifferentialDiagnosisPanel } from './components/DifferentialDiagnosisPa
 import { DatasetUploader } from './components/DatasetUploader';
 import { DatasetSummary } from './components/DatasetSummary';
 import { RecoveryTrendChart } from './components/RecoveryTrendChart';
-import { TouchPadCanvas } from './components/TouchPadCanvas';
+import {
+  TouchPadCanvas,
+  DrawingStroke,
+  CanvasDrawMode,
+  renderDrawingToCanvas,
+} from './components/TouchPadCanvas';
 import { LanguageSelector } from './components/LanguageSelector';
 import {
   CalibrationModal,
@@ -54,6 +64,8 @@ import {
   Zap,
   ShieldCheck,
   Cpu,
+  Eye,
+  Download,
 } from 'lucide-react';
 import { generateClinicalReport } from './lib/reportGenerator';
 import {
@@ -92,6 +104,124 @@ export interface Session {
   avgForce?: number;
   integrityHash?: string;
   data: SensorData[];
+  // Complete section archive fields (drawing, read telemetry stats, KPI, Differential & Dataset Summary)
+  rawSampleCount?: number;
+  drawingStrokes?: DrawingStroke[];
+  canvasMode?: CanvasDrawMode;
+  canvasWidth?: number;
+  canvasHeight?: number;
+  analysis?: DifferentialAnalysisResult;
+  datasetSummary?: DatasetSectionSummary;
+  sensorStats?: SensorChannelStats;
+  recoveryRate?: number;
+  previousSectionRms?: number;
+  sectionComparisonLabel?: string;
+  connectionType?: string | null;
+  sensitivity?: SensitivityLevel;
+  sensitivityMultiplier?: number;
+  calibrationOffsets?: CalibrationOffsets;
+}
+
+function serializeSessionPayload(session: Session): string {
+  return JSON.stringify({
+    version: 2,
+    frames: session.data,
+    rawSampleCount: session.rawSampleCount ?? session.data.length,
+    drawingStrokes: session.drawingStrokes ?? [],
+    canvasMode: session.canvasMode ?? 'spiral',
+    canvasWidth: session.canvasWidth ?? 800,
+    canvasHeight: session.canvasHeight ?? 320,
+    analysis: session.analysis,
+    datasetSummary: session.datasetSummary,
+    sensorStats: session.sensorStats,
+    recoveryRate: session.recoveryRate,
+    previousSectionRms: session.previousSectionRms,
+    sectionComparisonLabel: session.sectionComparisonLabel,
+    connectionType: session.connectionType ?? null,
+    sensitivity: session.sensitivity,
+    sensitivityMultiplier: session.sensitivityMultiplier,
+    calibrationOffsets: session.calibrationOffsets,
+  });
+}
+
+function deserializeSessionDoc(d: Record<string, any>): Session {
+  const parsed = typeof d.data === 'string' ? JSON.parse(d.data) : d.data;
+  const isV2Archive =
+    parsed && !Array.isArray(parsed) && typeof parsed === 'object' && Array.isArray(parsed.frames);
+  const frames: SensorData[] = isV2Archive
+    ? parsed.frames
+    : Array.isArray(parsed)
+    ? parsed
+    : [];
+
+  const mult = isV2Archive && parsed.sensitivityMultiplier ? parsed.sensitivityMultiplier : 1.35;
+  const analysis: DifferentialAnalysisResult =
+    (isV2Archive && parsed.analysis) ||
+    analyzeTremorDifferential(frames, 'pen', mult);
+  const datasetSummary: DatasetSectionSummary =
+    (isV2Archive && parsed.datasetSummary) ||
+    computeDatasetSectionSummary(frames, 'pen', mult);
+  const sensorStats: SensorChannelStats =
+    (isV2Archive && parsed.sensorStats) || computeSensorChannelStats(frames);
+
+  return {
+    id: d.id,
+    userId: d.userId,
+    timestamp: d.timestamp,
+    duration: d.duration,
+    severity: d.severity,
+    stage: d.stage,
+    rms: d.rms,
+    frequency: d.frequency,
+    phenotype: d.phenotype || analysis.phenotype,
+    pdProbability: d.pdProbability ?? analysis.pdProbability,
+    etProbability: d.etProbability ?? analysis.etProbability,
+    pillRollingIndex: d.pillRollingIndex ?? analysis.pillRollingIndex,
+    avgForce: d.avgForce ?? analysis.avgForce,
+    integrityHash: d.integrityHash,
+    data: frames,
+    rawSampleCount: isV2Archive ? parsed.rawSampleCount : frames.length,
+    drawingStrokes: isV2Archive ? parsed.drawingStrokes : d.drawingStrokes,
+    canvasMode: isV2Archive ? parsed.canvasMode : d.canvasMode || 'spiral',
+    canvasWidth: isV2Archive ? parsed.canvasWidth : d.canvasWidth || 800,
+    canvasHeight: isV2Archive ? parsed.canvasHeight : d.canvasHeight || 320,
+    analysis,
+    datasetSummary,
+    sensorStats,
+    recoveryRate: isV2Archive ? parsed.recoveryRate : d.recoveryRate,
+    previousSectionRms: isV2Archive ? parsed.previousSectionRms : d.previousSectionRms,
+    sectionComparisonLabel: isV2Archive ? parsed.sectionComparisonLabel : d.sectionComparisonLabel,
+    connectionType: isV2Archive ? parsed.connectionType : d.connectionType,
+    sensitivity: isV2Archive ? parsed.sensitivity : d.sensitivity,
+    sensitivityMultiplier: isV2Archive ? parsed.sensitivityMultiplier : d.sensitivityMultiplier,
+    calibrationOffsets: isV2Archive ? parsed.calibrationOffsets : d.calibrationOffsets,
+  };
+}
+
+function SavedDrawingPreview({
+  strokes,
+  mode = 'spiral',
+}: {
+  strokes?: DrawingStroke[];
+  mode?: CanvasDrawMode;
+}) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const canvas = ref.current;
+    const ctx = canvas?.getContext('2d');
+    if (canvas && ctx) {
+      renderDrawingToCanvas(ctx, canvas.width, canvas.height, mode, strokes || []);
+    }
+  }, [strokes, mode]);
+
+  return (
+    <canvas
+      ref={ref}
+      width={480}
+      height={190}
+      className="w-full h-44 bg-slate-950 rounded-md border border-slate-800 block"
+    />
+  );
 }
 
 function App() {
@@ -116,6 +246,8 @@ function App() {
   const [latestIntegrityHash, setLatestIntegrityHash] = useState<string | null>(null);
 
   const [data, setData] = useState<SensorData[]>([]);
+  const [sectionData, setSectionData] = useState<SensorData[]>([]);
+  const sectionJustSavedRef = useRef<boolean>(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recordedSessions, setRecordedSessions] = useState<Session[]>([]);
   const [isDrawingOnCanvas, setIsDrawingOnCanvas] = useState(false);
@@ -287,8 +419,18 @@ function App() {
   const uiUpdateInterval = useRef<NodeJS.Timeout | null>(null);
   const startTimeRef = useRef<number>(Date.now());
   const recordingBuffer = useRef<SensorData[]>([]);
+  const sectionDataBuffer = useRef<SensorData[]>([]);
+  const activeDrawingStrokesRef = useRef<DrawingStroke[]>([]);
+  const activeCanvasMetaRef = useRef<{ mode: CanvasDrawMode; width: number; height: number }>({
+    mode: 'spiral',
+    width: 800,
+    height: 320,
+  });
+  const [replayStrokes, setReplayStrokes] = useState<DrawingStroke[] | null>(null);
+  const [expandedSessionId, setExpandedSessionId] = useState<string | null>(null);
   const uiBuffer = useRef<SensorData[]>([]);
   const recordingStartTime = useRef<number>(0);
+  const sectionStartTimeRef = useRef<number>(0);
 
   const MAX_POINTS = 100;
 
@@ -308,6 +450,9 @@ function App() {
         }
         return updated;
       });
+      if (sectionDataBuffer.current.length > 0) {
+        setSectionData([...sectionDataBuffer.current]);
+      }
     }, 100);
 
     return () => {
@@ -353,23 +498,7 @@ function App() {
         snapshot.forEach((docSnap) => {
           const d = docSnap.data();
           try {
-            sessions.push({
-              id: d.id,
-              userId: d.userId,
-              timestamp: d.timestamp,
-              duration: d.duration,
-              severity: d.severity,
-              stage: d.stage,
-              rms: d.rms,
-              frequency: d.frequency,
-              phenotype: d.phenotype,
-              pdProbability: d.pdProbability,
-              etProbability: d.etProbability,
-              pillRollingIndex: d.pillRollingIndex,
-              avgForce: d.avgForce,
-              integrityHash: d.integrityHash,
-              data: JSON.parse(d.data),
-            });
+            sessions.push(deserializeSessionDoc(d));
           } catch (e) {
             console.error('Failed to parse session data', e);
           }
@@ -424,11 +553,20 @@ function App() {
     runInference();
   }, [data, connectionType]);
 
-  // Compute real-time Differential Analysis & Metrics
+  // Compute Differential Analysis & Metrics as the average of the total section reading (never just the last-second window)
+  const activeSectionFrames = React.useMemo(() => {
+    if (sectionData.length >= 12) return sectionData;
+    if (data.length >= 12) return data;
+    if (recordedSessions.length > 0 && recordedSessions[0].data.length >= 12) {
+      return recordedSessions[0].data;
+    }
+    return data;
+  }, [sectionData, data, recordedSessions]);
+
   const differential = React.useMemo(() => {
     const deviceType = connectionType === 'mobile' ? 'mobile' : 'pen';
-    return analyzeTremorDifferential(data, deviceType, sensitivityMultiplier);
-  }, [data, connectionType, sensitivityMultiplier]);
+    return analyzeTremorDifferential(activeSectionFrames, deviceType, sensitivityMultiplier);
+  }, [activeSectionFrames, connectionType, sensitivityMultiplier]);
 
   const metrics = React.useMemo(() => {
     const recoverySummary = computeRecoveryAnalysis({
@@ -531,6 +669,20 @@ function App() {
       }
 
       uiBuffer.current.push(finalData);
+
+      // If a previous section was just saved, reset the section buffer on the first sample of the next section
+      if (sectionJustSavedRef.current) {
+        sectionJustSavedRef.current = false;
+        sectionDataBuffer.current = [];
+      }
+
+      // Accumulate every single read telemetry sample for the current section (up to 3,000 frames)
+      if (sectionDataBuffer.current.length === 0) {
+        sectionStartTimeRef.current = Date.now();
+      }
+      if (sectionDataBuffer.current.length < 3000) {
+        sectionDataBuffer.current.push(finalData);
+      }
 
       if (isRecording) {
         recordingBuffer.current.push(finalData);
@@ -791,7 +943,10 @@ function App() {
         initialSeed.push(generateSimulatedSample(elapsed, profile, baseStartTs + i * 20));
       }
       simSampleCountRef.current = 80;
+      sectionDataBuffer.current = [...initialSeed];
+      sectionJustSavedRef.current = false;
       setData(initialSeed);
+      setSectionData(initialSeed);
 
       simulationInterval.current = setInterval(() => {
         const idx = simSampleCountRef.current++;
@@ -821,6 +976,12 @@ function App() {
 
   const clearData = () => {
     setData([]);
+    setSectionData([]);
+    sectionJustSavedRef.current = false;
+    sectionDataBuffer.current = [];
+    recordingBuffer.current = [];
+    activeDrawingStrokesRef.current = [];
+    setReplayStrokes(null);
   };
 
   const startCalibration = (
@@ -956,13 +1117,44 @@ function App() {
     calibrationOffsets.current = newOffsets;
   };
 
-  const exportSession = () => {
-    if (data.length === 0) return;
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const exportSession = (targetSession?: Session) => {
+    if (targetSession) {
+      const blob = new Blob([JSON.stringify(targetSession, null, 2)], {
+        type: 'application/json',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `neurotremor-section-${targetSession.id.slice(0, 8)}-${new Date(
+        targetSession.timestamp
+      ).toISOString()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      return;
+    }
+
+    const rawFrames =
+      sectionDataBuffer.current.length > 0 ? sectionDataBuffer.current : data;
+    if (rawFrames.length === 0) return;
+    const deviceType = connectionType === 'mobile' ? 'mobile' : 'pen';
+    const fullExport = {
+      exportedAt: new Date().toISOString(),
+      connectionType,
+      sensitivity,
+      sensitivityMultiplier,
+      calibrationOffsets: offsets,
+      canvasMode: activeCanvasMetaRef.current.mode,
+      drawingStrokes: activeDrawingStrokesRef.current,
+      analysis: analyzeTremorDifferential(rawFrames, deviceType, sensitivityMultiplier),
+      sensorStats: computeSensorChannelStats(rawFrames),
+      rawSampleCount: rawFrames.length,
+      data: rawFrames,
+    };
+    const blob = new Blob([JSON.stringify(fullExport, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `tremor-session-${new Date().toISOString()}.json`;
+    a.download = `tremor-section-${new Date().toISOString()}.json`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -1000,33 +1192,102 @@ function App() {
   const handleStopAndSaveRecording = async () => {
     audioFeedback.playStopRecording();
     setIsRecording(false);
-    const duration = Math.max(0.5, (Date.now() - recordingStartTime.current) / 1000);
+
+    // Prefer manual recordingBuffer if active, otherwise use the complete uncapped sectionDataBuffer or sectionData
     const rawFrames =
-      recordingBuffer.current.length >= 12 ? [...recordingBuffer.current] : [...data];
+      recordingBuffer.current.length >= 12
+        ? [...recordingBuffer.current]
+        : sectionDataBuffer.current.length >= 12
+        ? [...sectionDataBuffer.current]
+        : sectionData.length >= 12
+        ? [...sectionData]
+        : [...data];
+
     recordingBuffer.current = [];
+    sectionDataBuffer.current = [];
+    sectionJustSavedRef.current = true;
+    setSectionData(rawFrames);
 
     if (rawFrames.length === 0) return;
+
+    const firstTs = rawFrames[0]?.timestamp || sectionStartTimeRef.current || Date.now();
+    const lastTs = rawFrames[rawFrames.length - 1]?.timestamp || Date.now();
+    const duration = Math.max(
+      0.5,
+      recordingStartTime.current > 0
+        ? (Date.now() - recordingStartTime.current) / 1000
+        : (lastTs - firstTs) / 1000
+    );
+    recordingStartTime.current = 0;
 
     const sessionId = crypto.randomUUID();
     const deviceType = connectionType === 'mobile' ? 'mobile' : 'pen';
 
-    // Verify & downsample via backend API (with automatic offline fallback)
+    // Verify & preserve high-density telemetry frames (up to 1,500 points)
     const verifiedRes = await verifyAndCompressSession({
       sessionId,
       data: rawFrames,
       deviceType,
       sensitivityMultiplier,
-      maxStoragePoints: 350,
+      maxStoragePoints: 1500,
     });
 
     setLatestIntegrityHash(verifiedRes.integrityHash);
     const diffAnalysis = verifiedRes.analysis;
+    const datasetSummary = computeDatasetSectionSummary(
+      rawFrames,
+      deviceType,
+      sensitivityMultiplier
+    );
+    const sensorStats = computeSensorChannelStats(rawFrames);
+
+    // Capture all drawn strokes; if touchX/touchY exist in frames without explicit strokes, synthesize a stroke
+    let savedStrokes: DrawingStroke[] = [...activeDrawingStrokesRef.current];
+    if (savedStrokes.length === 0) {
+      const touchPts = rawFrames
+        .filter((f) => typeof f.touchX === 'number' && typeof f.touchY === 'number')
+        .map((f) => ({
+          x: Number((f.touchX || 0).toFixed(1)),
+          y: Number((f.touchY || 0).toFixed(1)),
+          pressure: Math.round(f.fsr || 2048),
+          t: f.timestamp,
+        }));
+      if (touchPts.length > 1) {
+        savedStrokes = [
+          {
+            mode: activeCanvasMetaRef.current.mode,
+            canvasWidth: activeCanvasMetaRef.current.width,
+            canvasHeight: activeCanvasMetaRef.current.height,
+            points: touchPts,
+          },
+        ];
+      }
+    }
+    activeDrawingStrokesRef.current = [];
+
+    // Compute sequential section-over-section recovery rate against the immediately previous recorded section
+    const prevRecorded = recordedSessions.length > 0 ? recordedSessions[0] : null;
+    const nextSectionNum = recordedSessions.length + 1;
+    const sectionComparisonLabel =
+      prevRecorded && recordedSessions.length >= 1
+        ? `S-${nextSectionNum} vs. S-${nextSectionNum - 1}`
+        : 'S-1 Baseline Saved';
+    const previousSectionRms = prevRecorded ? prevRecorded.rms : undefined;
+    const sequentialRecoveryRate =
+      prevRecorded && prevRecorded.rms >= 0.05
+        ? Number(
+            Math.max(
+              -100,
+              Math.min(100, ((prevRecorded.rms - diffAnalysis.rms) / prevRecorded.rms) * 100)
+            ).toFixed(1)
+          )
+        : 0;
 
     const newSession: Session = {
       id: sessionId,
       userId: user ? user.uid : 'guest',
       timestamp: Date.now(),
-      duration,
+      duration: Number(duration.toFixed(2)),
       severity: diffAnalysis.severityLabel,
       stage: diffAnalysis.clinicalStage,
       rms: diffAnalysis.rms,
@@ -1038,6 +1299,21 @@ function App() {
       avgForce: diffAnalysis.avgForce,
       integrityHash: verifiedRes.integrityHash,
       data: verifiedRes.compressedData,
+      rawSampleCount: rawFrames.length,
+      drawingStrokes: savedStrokes,
+      canvasMode: activeCanvasMetaRef.current.mode,
+      canvasWidth: activeCanvasMetaRef.current.width,
+      canvasHeight: activeCanvasMetaRef.current.height,
+      analysis: diffAnalysis,
+      datasetSummary,
+      sensorStats,
+      recoveryRate: sequentialRecoveryRate,
+      previousSectionRms,
+      sectionComparisonLabel,
+      connectionType,
+      sensitivity,
+      sensitivityMultiplier,
+      calibrationOffsets: { ...offsets },
     };
 
     if (!user) {
@@ -1064,10 +1340,26 @@ function App() {
       );
     } catch {}
 
-    setDoc(doc(db, 'sessions', sessionId), {
-      ...newSession,
-      data: JSON.stringify(newSession.data),
-    })
+    // Persist complete section archive to Firestore conforming strictly to hardened security rules
+    const firestoreDocPayload = {
+      id: newSession.id,
+      userId: newSession.userId,
+      timestamp: newSession.timestamp,
+      duration: newSession.duration,
+      severity: newSession.severity,
+      stage: newSession.stage,
+      rms: newSession.rms,
+      frequency: newSession.frequency,
+      phenotype: newSession.phenotype || 'Resting Baseline',
+      pdProbability: newSession.pdProbability ?? 0,
+      etProbability: newSession.etProbability ?? 0,
+      pillRollingIndex: newSession.pillRollingIndex ?? 0,
+      avgForce: newSession.avgForce ?? 0,
+      integrityHash: newSession.integrityHash || '',
+      data: serializeSessionPayload(newSession),
+    };
+
+    setDoc(doc(db, 'sessions', sessionId), firestoreDocPayload)
       .then(() => {
         mlService.trainOnSession(newSession.data, newSession.severity);
       })
@@ -1572,7 +1864,13 @@ function App() {
 
         {isPausedDataset && (
           <DatasetSummary
-            data={data}
+            data={
+              loadedDataset
+                ? loadedDataset.slice(0, Math.max(12, playbackIndex + 1))
+                : sectionData.length > 0
+                ? sectionData
+                : data
+            }
             title={t('analysisUntilPause')}
             onPlay={resumeDatasetPlayback}
             onClear={() => {
@@ -1581,6 +1879,7 @@ function App() {
             }}
             onRequestReport={(sess) => setReportModalSession(sess)}
             isDark={!isHighContrast}
+            sensitivityMultiplier={sensitivityMultiplier}
           />
         )}
 
@@ -1591,6 +1890,19 @@ function App() {
             onClear={() => setLoadedDataset(null)}
             onRequestReport={(sess) => setReportModalSession(sess)}
             isDark={!isHighContrast}
+            sensitivityMultiplier={sensitivityMultiplier}
+          />
+        )}
+
+        {!loadedDataset && !isPlayingDataset && sectionData.length >= 12 && (
+          <DatasetSummary
+            data={sectionData}
+            title={`${t('datasetAnalysisSummary')} (Total Section Average)`}
+            onPlay={() => startDatasetPlayback(sectionData)}
+            onClear={clearData}
+            onRequestReport={(sess) => setReportModalSession(sess)}
+            isDark={!isHighContrast}
+            sensitivityMultiplier={sensitivityMultiplier}
           />
         )}
 
@@ -1600,9 +1912,9 @@ function App() {
               <div>
                 <span className="text-xs font-semibold text-sky-800 dark:text-sky-400 font-mono">
                   {isDrawingOnCanvas
-                    ? `● ${t('realtimeAnalysisLive')} (Active Canvas Stroke)`
-                    : data.length > 0
-                    ? `○ Stroke Paused · ${data.length} Samples Captured`
+                    ? `● ${t('realtimeAnalysisLive')} (Active Canvas Stroke · ${sectionData.length || data.length} pts)`
+                    : sectionData.length > 0
+                    ? `○ Section Averaged · ${sectionData.length} Total Section Samples`
                     : '○ Pen Connected · Standby (Start Drawing on Spiral or Free-Draw Canvas Below)'}
                 </span>
                 <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
@@ -1617,7 +1929,7 @@ function App() {
                     : 'Tremor measurement starts only when you draw on the trackpad spiral or free-draw canvas.'}
                 </div>
               </div>
-              {data.length > 0 && (
+              {(sectionData.length > 0 || data.length > 0) && (
                 <div className="flex space-x-1.5">
                   {isPausedRealTime ? (
                     <button
@@ -1639,7 +1951,13 @@ function App() {
                   <button
                     onClick={() => {
                       setIsPausedRealTime(false);
-                      setLoadedDataset(data);
+                      const fullSection =
+                        sectionDataBuffer.current.length > 0
+                          ? [...sectionDataBuffer.current]
+                          : sectionData.length > 0
+                          ? [...sectionData]
+                          : [...data];
+                      setLoadedDataset(fullSection);
                       disconnect();
                     }}
                     className="flex items-center space-x-1.5 px-3 py-1.5 bg-red-50 text-red-700 border border-red-200 dark:bg-red-950/30 dark:text-red-400 dark:border-red-900/50 rounded-md hover:bg-red-100 transition-colors text-xs font-medium"
@@ -1660,7 +1978,19 @@ function App() {
             onDrawingStateChange={(drawing) => {
               isDrawingOnCanvasRef.current = drawing;
               setIsDrawingOnCanvas(drawing);
+              if (!drawing && sectionDataBuffer.current.length > 0) {
+                setSectionData([...sectionDataBuffer.current]);
+              }
             }}
+            onStrokesChange={(strokes, canvasMode, canvasWidth, canvasHeight) => {
+              activeDrawingStrokesRef.current = strokes;
+              activeCanvasMetaRef.current = {
+                mode: canvasMode,
+                width: canvasWidth,
+                height: canvasHeight,
+              };
+            }}
+            replayStrokes={replayStrokes}
             onClearData={clearData}
             onSaveDrawingSession={handleStopAndSaveRecording}
             isRecording={isRecording}
@@ -1674,7 +2004,7 @@ function App() {
                 recordingStartTime.current = Date.now();
               }
             }}
-            sampleCount={data.length}
+            sampleCount={sectionData.length || sectionDataBuffer.current.length || data.length}
             onTouchUpdate={(x, y, _pressure, syntheticFrame) => {
               latestTouchRef.current = { x, y };
               if (
@@ -1708,7 +2038,11 @@ function App() {
             recoverySummary={metrics.recoverySummary}
             isDark={!isHighContrast}
             isConnected={isConnected}
-            canSaveSection={data.length >= 12 || recordingBuffer.current.length >= 12}
+            canSaveSection={
+              sectionData.length >= 12 ||
+              data.length >= 12 ||
+              recordingBuffer.current.length >= 12
+            }
             onCaptureSnapshot={handleStopAndSaveRecording}
           />
         </div>
@@ -1899,10 +2233,10 @@ function App() {
               </div>
               <div className="flex gap-1.5">
                 <button
-                  onClick={exportSession}
+                  onClick={() => exportSession()}
                   aria-label="Export Session as JSON"
                   className="text-slate-400 hover:text-sky-700 dark:text-slate-500 dark:hover:text-sky-400 transition-colors p-1.5 rounded hover:bg-slate-100 dark:hover:bg-slate-800"
-                  title="Export Session as JSON"
+                  title="Export Complete Active Section as JSON"
                 >
                   <Save size={15} />
                 </button>
@@ -2053,7 +2387,7 @@ function App() {
                     {t('clearAll')}
                   </button>
                 </div>
-                <div className="space-y-2">
+                <div className="space-y-2.5">
                   {recordedSessions.map((session, idx) => {
                     // recordedSessions is ordered newest-first; chronological index is (total - idx)
                     const total = recordedSessions.length;
@@ -2072,134 +2406,540 @@ function App() {
                           )
                         : null;
 
+                    const isExpanded = expandedSessionId === session.id;
+                    const sessionMult = session.sensitivityMultiplier ?? sensitivityMultiplier;
+                    const sessionDiff =
+                      session.analysis ||
+                      analyzeTremorDifferential(session.data, 'pen', sessionMult);
+                    const sessionSummary =
+                      session.datasetSummary ||
+                      computeDatasetSectionSummary(session.data, 'pen', sessionMult);
+                    const sessionStats =
+                      session.sensorStats || computeSensorChannelStats(session.data);
+                    const strokeCount = session.drawingStrokes?.length || 0;
+                    const comparisonLabel =
+                      session.sectionComparisonLabel ||
+                      (seqRecovery === null ? 'S-1 Baseline Saved' : `S-${sectionNum} vs. S-${sectionNum - 1}`);
+
                     return (
                       <div
                         key={session.id}
-                        className="flex flex-wrap justify-between items-center gap-3 bg-slate-50 dark:bg-slate-950/60 px-3.5 py-2.5 rounded-md text-xs border border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700 transition-colors"
+                        className="bg-slate-50 dark:bg-slate-950/60 rounded-md text-xs border border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700 transition-colors overflow-hidden"
                       >
-                        <div className="flex flex-wrap items-center gap-2 font-mono tabular-nums">
-                          <span className="text-sky-700 dark:text-sky-400 font-bold">
-                            S-{sectionNum}
-                          </span>
-                          <span aria-hidden="true" className="text-slate-400">
-                            ·
-                          </span>
-                          <span className="text-slate-900 dark:text-slate-100 font-semibold">
-                            {new Date(session.timestamp).toLocaleTimeString([], {
-                              hour: '2-digit',
-                              minute: '2-digit',
-                              second: '2-digit',
-                            })}
-                          </span>
-                          <span aria-hidden="true" className="text-slate-400">
-                            ·
-                          </span>
-                          <span className="text-slate-600 dark:text-slate-400">
-                            {(session.rms / 9.80665).toFixed(3)}g ({session.duration.toFixed(1)}s · {session.data.length} pts)
-                          </span>
-                          <span aria-hidden="true" className="text-slate-400">
-                            ·
-                          </span>
-                          <span
-                            className={`font-semibold ${
-                              seqRecovery === null
-                                ? 'text-slate-500 dark:text-slate-400'
-                                : seqRecovery > 2.0
-                                ? 'text-emerald-700 dark:text-emerald-400'
-                                : seqRecovery < -2.0
-                                ? 'text-amber-700 dark:text-amber-400'
-                                : 'text-slate-700 dark:text-slate-300'
-                            }`}
-                          >
-                            {seqRecovery === null
-                              ? 'Recovery: 0.0% (Initial S-1)'
-                              : `Recovery: ${seqRecovery > 0 ? '+' : ''}${seqRecovery.toFixed(1)}% (vs. S-${sectionNum - 1})`}
-                          </span>
-                          <span aria-hidden="true" className="text-slate-400">
-                            ·
-                          </span>
-                          <span className="font-sans font-medium text-sky-700 dark:text-sky-400">
-                            {session.phenotype || `${session.frequency.toFixed(1)} Hz`}
-                          </span>
-                          {session.integrityHash && (
-                            <>
-                              <span aria-hidden="true" className="text-slate-400">
-                                ·
-                              </span>
-                              <span
-                                className="inline-flex items-center gap-1 text-[11px] text-emerald-700 dark:text-emerald-400"
-                                title={`Server HMAC-SHA256 Digest: ${session.integrityHash}`}
-                              >
-                                <ShieldCheck size={12} />
-                                {session.integrityHash.slice(0, 8)}
-                              </span>
-                            </>
-                          )}
-                        </div>
+                        <div className="flex flex-wrap justify-between items-center gap-3 px-3.5 py-2.5">
+                          <div className="flex flex-wrap items-center gap-2 font-mono tabular-nums">
+                            <span className="text-sky-700 dark:text-sky-400 font-bold">
+                              S-{sectionNum}
+                            </span>
+                            <span aria-hidden="true" className="text-slate-400">
+                              ·
+                            </span>
+                            <span className="text-slate-900 dark:text-slate-100 font-semibold">
+                              {new Date(session.timestamp).toLocaleTimeString([], {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                second: '2-digit',
+                              })}
+                            </span>
+                            <span aria-hidden="true" className="text-slate-400">
+                              ·
+                            </span>
+                            <span className="text-slate-600 dark:text-slate-400">
+                              {(session.rms / 9.80665).toFixed(3)}g ({session.duration.toFixed(1)}s ·{' '}
+                              {session.rawSampleCount || session.data.length} pts
+                              {strokeCount > 0
+                                ? ` · ${strokeCount} ${strokeCount === 1 ? 'stroke' : 'strokes'}`
+                                : ''}
+                              )
+                            </span>
+                            <span aria-hidden="true" className="text-slate-400">
+                              ·
+                            </span>
+                            <span
+                              className={`font-semibold ${
+                                seqRecovery === null
+                                  ? 'text-slate-500 dark:text-slate-400'
+                                  : seqRecovery > 2.0
+                                  ? 'text-emerald-700 dark:text-emerald-400'
+                                  : seqRecovery < -2.0
+                                  ? 'text-amber-700 dark:text-amber-400'
+                                  : 'text-slate-700 dark:text-slate-300'
+                              }`}
+                            >
+                              {seqRecovery === null
+                                ? 'Recovery: 0.0% (Initial S-1)'
+                                : `Recovery: ${seqRecovery > 0 ? '+' : ''}${seqRecovery.toFixed(1)}% (vs. S-${sectionNum - 1})`}
+                            </span>
+                            <span aria-hidden="true" className="text-slate-400">
+                              ·
+                            </span>
+                            <span className="font-sans font-medium text-sky-700 dark:text-sky-400">
+                              {session.phenotype || `${session.frequency.toFixed(1)} Hz`}
+                            </span>
+                            {session.integrityHash && (
+                              <>
+                                <span aria-hidden="true" className="text-slate-400">
+                                  ·
+                                </span>
+                                <span
+                                  className="inline-flex items-center gap-1 text-[11px] text-emerald-700 dark:text-emerald-400"
+                                  title={`Server HMAC-SHA256 Digest: ${session.integrityHash}`}
+                                >
+                                  <ShieldCheck size={12} />
+                                  {session.integrityHash.slice(0, 8)}
+                                </span>
+                              </>
+                            )}
+                          </div>
 
-                        <div className="flex items-center gap-3">
-                          <span
-                            className={`font-medium ${
-                              session.severity === 'Severe'
-                                ? 'text-rose-700 dark:text-rose-400'
-                                : session.severity === 'Moderate'
-                                ? 'text-amber-700 dark:text-amber-400'
-                                : 'text-emerald-700 dark:text-emerald-400'
-                            }`}
-                          >
-                            {session.severity} ({session.stage})
-                          </span>
-                          <div className="flex items-center gap-1">
-                            <button
-                              onClick={() => setReportModalSession(session)}
-                              aria-label={`Download Clinical Report for session ${session.id.slice(0, 6)}`}
-                              className="p-1.5 text-slate-600 hover:text-sky-700 dark:text-slate-400 dark:hover:text-sky-400 transition-colors"
-                              title={t('downloadReport')}
+                          <div className="flex items-center gap-3">
+                            <span
+                              className={`font-medium ${
+                                session.severity === 'Severe'
+                                  ? 'text-rose-700 dark:text-rose-400'
+                                  : session.severity === 'Moderate'
+                                  ? 'text-amber-700 dark:text-amber-400'
+                                  : 'text-emerald-700 dark:text-emerald-400'
+                              }`}
                             >
-                              <FileText size={14} />
-                            </button>
-                            <button
-                              onClick={() => {
-                                setLoadedDataset(session.data);
-                                startDatasetPlayback(session.data);
-                              }}
-                              aria-label={`Replay session ${session.id.slice(0, 6)}`}
-                              className="p-1.5 text-slate-600 hover:text-emerald-700 dark:text-slate-400 dark:hover:text-emerald-400 transition-colors"
-                              title={t('replaySession')}
-                            >
-                              <Play size={14} />
-                            </button>
-                            <button
-                              onClick={async () => {
-                                if (!user) {
-                                  const filtered = recordedSessions.filter(
-                                    (s) => s.id !== session.id
-                                  );
-                                  setRecordedSessions(filtered);
-                                  localStorage.setItem(
-                                    'neurotremor_guest_sessions',
-                                    JSON.stringify(filtered)
-                                  );
-                                  return;
+                              {session.severity} ({session.stage})
+                            </span>
+                            <div className="flex items-center gap-1">
+                              <button
+                                onClick={() =>
+                                  setExpandedSessionId(isExpanded ? null : session.id)
                                 }
-                                try {
-                                  await deleteDoc(doc(db, 'sessions', session.id));
-                                } catch (error) {
-                                  handleFirestoreError(
-                                    error,
-                                    OperationType.DELETE,
-                                    `sessions/${session.id}`
-                                  );
-                                }
-                              }}
-                              aria-label={`Delete session ${session.id.slice(0, 6)}`}
-                              className="p-1.5 text-slate-600 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 transition-colors"
-                              title={t('deleteSession')}
-                            >
-                              <Trash2 size={14} />
-                            </button>
+                                aria-label={`Inspect all saved data and drawing for session S-${sectionNum}`}
+                                className={`p-1.5 rounded transition-colors ${
+                                  isExpanded
+                                    ? 'bg-sky-100 text-sky-800 dark:bg-sky-900/50 dark:text-sky-300'
+                                    : 'text-slate-600 hover:text-sky-700 dark:text-slate-400 dark:hover:text-sky-400'
+                                }`}
+                                title="Inspect Saved Drawing, KPI Readings, Differential Classifier, Dataset Summary & Sensor Channels"
+                              >
+                                <Eye size={14} />
+                              </button>
+                              <button
+                                onClick={() => exportSession(session)}
+                                aria-label={`Export complete JSON for session S-${sectionNum}`}
+                                className="p-1.5 text-slate-600 hover:text-sky-700 dark:text-slate-400 dark:hover:text-sky-400 transition-colors"
+                                title="Download Complete Section JSON (Drawing + Raw Telemetry + Calculated Metrics)"
+                              >
+                                <Download size={14} />
+                              </button>
+                              <button
+                                onClick={() => setReportModalSession(session)}
+                                aria-label={`Download Clinical Report for session ${session.id.slice(0, 6)}`}
+                                className="p-1.5 text-slate-600 hover:text-sky-700 dark:text-slate-400 dark:hover:text-sky-400 transition-colors"
+                                title={t('downloadReport')}
+                              >
+                                <FileText size={14} />
+                              </button>
+                              <button
+                                onClick={() => {
+                                  if (session.drawingStrokes && session.drawingStrokes.length > 0) {
+                                    setReplayStrokes(session.drawingStrokes);
+                                  }
+                                  setSectionData(session.data);
+                                  setLoadedDataset(session.data);
+                                  startDatasetPlayback(session.data);
+                                }}
+                                aria-label={`Replay session ${session.id.slice(0, 6)}`}
+                                className="p-1.5 text-slate-600 hover:text-emerald-700 dark:text-slate-400 dark:hover:text-emerald-400 transition-colors"
+                                title={t('replaySession')}
+                              >
+                                <Play size={14} />
+                              </button>
+                              <button
+                                onClick={async () => {
+                                  if (!user) {
+                                    const filtered = recordedSessions.filter(
+                                      (s) => s.id !== session.id
+                                    );
+                                    setRecordedSessions(filtered);
+                                    localStorage.setItem(
+                                      'neurotremor_guest_sessions',
+                                      JSON.stringify(filtered)
+                                    );
+                                    return;
+                                  }
+                                  try {
+                                    await deleteDoc(doc(db, 'sessions', session.id));
+                                  } catch (error) {
+                                    handleFirestoreError(
+                                      error,
+                                      OperationType.DELETE,
+                                      `sessions/${session.id}`
+                                    );
+                                  }
+                                }}
+                                aria-label={`Delete session ${session.id.slice(0, 6)}`}
+                                className="p-1.5 text-slate-600 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 transition-colors"
+                                title={t('deleteSession')}
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
                           </div>
                         </div>
+
+                        {isExpanded && (
+                          <div className="border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 space-y-5">
+                            {/* 1. Saved 4 KPI Cards (Exact Match to Top KPI Strip) */}
+                            <div>
+                              <div className="text-xs font-semibold text-slate-800 dark:text-slate-200 mb-2">
+                                Saved Section KPI Readings (S-{sectionNum} Total Section Average)
+                              </div>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 font-mono">
+                                <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                  <div className="flex items-center justify-between text-[11px] font-sans text-slate-500 mb-1">
+                                    <span>RMS Amplitude</span>
+                                    <span className="font-mono">
+                                      {sessionDiff.estimatedExcursionCm > 0.02
+                                        ? `~${sessionDiff.estimatedExcursionCm.toFixed(2)} cm`
+                                        : 'Calibrated RMS'}
+                                    </span>
+                                  </div>
+                                  <div className="text-lg font-bold text-slate-900 dark:text-slate-100">
+                                    {sessionDiff.rmsG.toFixed(3)} g{' '}
+                                    <span className="text-xs font-normal text-slate-500">
+                                      · {sessionDiff.rms.toFixed(2)} m/s²
+                                    </span>
+                                  </div>
+                                  <div className="text-[11px] text-slate-500 mt-1">
+                                    Kinematic vector: {sessionDiff.kinematicBracket}
+                                  </div>
+                                </div>
+
+                                <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                  <div className="flex items-center justify-between text-[11px] font-sans text-slate-500 mb-1">
+                                    <span>Dominant Frequency</span>
+                                    <span className="font-mono text-sky-700 dark:text-sky-400">
+                                      {sessionDiff.is4to6HzPdLock ? '4–6 Hz PD Lock' : 'DFT Peak'}
+                                    </span>
+                                  </div>
+                                  <div className="text-lg font-bold text-slate-900 dark:text-slate-100">
+                                    {sessionDiff.dominantFreq.toFixed(1)} Hz
+                                  </div>
+                                  <div className="text-[11px] text-slate-500 mt-1">
+                                    Spectral cluster:{' '}
+                                    {sessionDiff.dominantFreq >= 3.5 &&
+                                    sessionDiff.dominantFreq <= 6.5
+                                      ? '3.5–6.5 Hz PD band'
+                                      : sessionDiff.dominantFreq > 6.5 &&
+                                        sessionDiff.dominantFreq <= 12
+                                      ? '6.5–12 Hz ET band'
+                                      : 'Physiological (<3.5 Hz)'}
+                                  </div>
+                                </div>
+
+                                <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                  <div className="flex items-center justify-between text-[11px] font-sans text-slate-500 mb-1">
+                                    <span>Clinical Severity Stage</span>
+                                    <span className="font-mono">
+                                      {sessionDiff.clinicalStage === 'Normal'
+                                        ? 'Stage 0'
+                                        : sessionDiff.clinicalStage}
+                                    </span>
+                                  </div>
+                                  <div className="text-lg font-bold text-slate-900 dark:text-slate-100">
+                                    {sessionDiff.severityLabel}{' '}
+                                    <span className="text-xs font-normal text-slate-500">
+                                      · UPDRS {sessionDiff.updrsScore.toFixed(1)}/4.0
+                                    </span>
+                                  </div>
+                                  <div className="text-[11px] text-slate-500 mt-1 truncate">
+                                    Clinical stage: {sessionDiff.hoehnYahrStage}
+                                  </div>
+                                </div>
+
+                                <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                  <div className="flex items-center justify-between text-[11px] font-sans text-slate-500 mb-1">
+                                    <span>Recovery Rate (Recorded)</span>
+                                    <span className="font-mono text-emerald-700 dark:text-emerald-400">
+                                      {comparisonLabel}
+                                    </span>
+                                  </div>
+                                  <div className="text-lg font-bold text-slate-900 dark:text-slate-100">
+                                    {seqRecovery === null
+                                      ? '0.0%'
+                                      : `${seqRecovery > 0 ? '+' : ''}${seqRecovery.toFixed(1)}%`}{' '}
+                                    <span className="text-xs font-normal text-slate-500">
+                                      {seqRecovery === null
+                                        ? 'baseline'
+                                        : seqRecovery > 2.0
+                                        ? 'reduction'
+                                        : seqRecovery < -2.0
+                                        ? 'increase'
+                                        : 'stable'}
+                                    </span>
+                                  </div>
+                                  <div className="text-[11px] text-slate-500 mt-1 flex justify-between">
+                                    <span>
+                                      {prevSession
+                                        ? `Prev: ${(prevSession.rms / 9.80665).toFixed(3)}g`
+                                        : 'Initial S-1'}
+                                    </span>
+                                    <span>Grip: {sessionDiff.avgForce} FSR</span>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* 2. Saved Differential Tremor & Grip Force Classifier Readings */}
+                            <div className="p-3.5 rounded-lg bg-slate-50/70 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 space-y-3">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                                  Differential Tremor & Grip Force Classifier — Phenotype Differentiation
+                                </span>
+                                {session.integrityHash && (
+                                  <span className="text-[11px] font-mono text-emerald-700 dark:text-emerald-400">
+                                    HMAC: {session.integrityHash.slice(0, 10)}
+                                  </span>
+                                )}
+                              </div>
+
+                              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                                {/* Phenotype & Probabilities */}
+                                <div className="p-3 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-2">
+                                  <div className="text-[11px] text-slate-500">
+                                    Detected Motor Phenotype
+                                  </div>
+                                  <div className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                                    {sessionDiff.phenotype}
+                                  </div>
+                                  <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
+                                    {sessionDiff.clinicalRationale}
+                                  </p>
+                                  <div className="space-y-1.5 pt-2 border-t border-slate-100 dark:border-slate-800 text-[11px] font-mono">
+                                    <div className="flex justify-between">
+                                      <span>Parkinsonian (4–6 Hz Resting / Pill-Rolling)</span>
+                                      <span className="font-bold text-sky-700 dark:text-sky-400">
+                                        {sessionDiff.pdProbability}%
+                                      </span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                      <span>Essential / Postural (6.5–12 Hz Kinetic)</span>
+                                      <span className="font-bold text-teal-700 dark:text-teal-400">
+                                        {sessionDiff.etProbability}%
+                                      </span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                      <span>Physiological / Voluntary Baseline</span>
+                                      <span className="font-bold text-slate-600 dark:text-slate-400">
+                                        {sessionDiff.normalProbability}%
+                                      </span>
+                                    </div>
+                                  </div>
+                                </div>
+
+                                {/* Power Spectral Density (DFT Hann Window) */}
+                                <div className="p-3 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-col justify-between">
+                                  <div>
+                                    <div className="flex items-center justify-between text-[11px] mb-1">
+                                      <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                        Power Spectral Density (DFT Hann Window)
+                                      </span>
+                                      <span className="font-mono font-semibold text-sky-700 dark:text-sky-400">
+                                        Peak: {sessionDiff.dominantFreq.toFixed(1)} Hz
+                                      </span>
+                                    </div>
+                                    <div className="grid grid-cols-4 gap-1.5 my-2 font-mono text-[10px]">
+                                      {sessionDiff.spectrum.map((bin) => (
+                                        <div
+                                          key={bin.label}
+                                          className="p-1.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200/80 dark:border-slate-800 text-center"
+                                        >
+                                          <div className="text-slate-500">{bin.label}</div>
+                                          <div className="font-bold text-slate-900 dark:text-slate-100">
+                                            {bin.power.toFixed(2)}
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                  <div className="text-[10px] font-mono text-slate-500 pt-2 border-t border-slate-100 dark:border-slate-800">
+                                    4–6Hz PD Core:{' '}
+                                    {Math.round(
+                                      (sessionDiff.pdCore4to6Power ?? sessionDiff.pdBandPower) * 100
+                                    )}
+                                    % (3.5–6.5Hz: {Math.round(sessionDiff.pdBandPower * 100)}%) · ET
+                                    (6.5–12Hz): {Math.round(sessionDiff.etBandPower * 100)}%
+                                  </div>
+                                </div>
+
+                                {/* 4 Differential Biomarker Cards */}
+                                <div className="grid grid-cols-2 gap-2 font-mono text-[11px]">
+                                  <div className="p-2.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-col justify-between">
+                                    <div className="font-sans text-slate-500">
+                                      Pill-Rolling Gyro Index
+                                    </div>
+                                    <div className="text-base font-bold text-slate-900 dark:text-slate-100">
+                                      {sessionDiff.pillRollingIndex} / 100
+                                    </div>
+                                    <div className="text-[10px] font-sans text-slate-500">
+                                      {sessionDiff.pillRollingIndex >= 45
+                                        ? 'Pronation-supination (PD)'
+                                        : 'Planar flexion-extension'}
+                                    </div>
+                                  </div>
+
+                                  <div className="p-2.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-col justify-between">
+                                    <div className="font-sans text-slate-500">
+                                      Spectral Rhythmicity (Q)
+                                    </div>
+                                    <div className="text-base font-bold text-slate-900 dark:text-slate-100">
+                                      {sessionDiff.spectralRegularity}%
+                                    </div>
+                                    <div className="text-[10px] font-sans text-slate-500">
+                                      {sessionDiff.spectralRegularity >= 55
+                                        ? `Constancy ${sessionDiff.constancyScore}/4 · Lock`
+                                        : 'Broadband / mixed kinematics'}
+                                    </div>
+                                  </div>
+
+                                  <div className="p-2.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-col justify-between">
+                                    <div className="font-sans text-slate-500">
+                                      Grip Force Stability
+                                    </div>
+                                    <div className="text-base font-bold text-slate-900 dark:text-slate-100">
+                                      {sessionDiff.avgForce} FSR
+                                    </div>
+                                    <div className="text-[10px] text-slate-500">
+                                      Slope:{' '}
+                                      {sessionDiff.gripDecaySlope > 0
+                                        ? `+${sessionDiff.gripDecaySlope}`
+                                        : sessionDiff.gripDecaySlope}
+                                      /s · CV {sessionDiff.forceCv}%
+                                    </div>
+                                  </div>
+
+                                  <div className="p-2.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-col justify-between">
+                                    <div className="font-sans text-slate-500">
+                                      MDS-UPDRS III Score
+                                    </div>
+                                    <div className="text-base font-bold text-slate-900 dark:text-slate-100">
+                                      {sessionDiff.updrsScore.toFixed(1)} / 4.0
+                                    </div>
+                                    <div className="text-[10px] text-slate-500">
+                                      Excursion: ~{sessionDiff.estimatedExcursionCm.toFixed(2)} cm ·
+                                      Decay: {sessionDiff.micrographiaIndex}%
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* 3. Saved Drawing + Saved Dataset Analysis Summary (Total Section Average) */}
+                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                              <div>
+                                <div className="flex items-center justify-between text-xs font-semibold text-slate-800 dark:text-slate-200 mb-2">
+                                  <span>
+                                    Saved Trackpad Drawing (
+                                    {session.canvasMode === 'freedraw'
+                                      ? 'Blank Free-Draw'
+                                      : 'Guided Spiral'}
+                                    )
+                                  </span>
+                                  <span className="font-mono text-slate-500">
+                                    {strokeCount} {strokeCount === 1 ? 'stroke' : 'strokes'}
+                                  </span>
+                                </div>
+                                <SavedDrawingPreview
+                                  strokes={session.drawingStrokes}
+                                  mode={session.canvasMode || 'spiral'}
+                                />
+                              </div>
+
+                              <div className="space-y-2">
+                                <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                                  Dataset Analysis Summary (Total Section Average ·{' '}
+                                  {sessionSummary.segmentCount} Windows Averaged)
+                                </div>
+                                <div className="grid grid-cols-2 gap-2 font-mono text-[11px]">
+                                  <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                    <div className="text-slate-500">Total Points (Section)</div>
+                                    <div className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                                      {sessionSummary.totalPoints.toLocaleString()} pts (
+                                      {sessionSummary.durationSec.toFixed(1)}s)
+                                    </div>
+                                  </div>
+                                  <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                    <div className="text-slate-500">Dominant Freq (Avg)</div>
+                                    <div className="text-sm font-bold text-sky-700 dark:text-sky-400">
+                                      {sessionSummary.avgFrequency.toFixed(1)} Hz
+                                    </div>
+                                  </div>
+                                  <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                    <div className="text-slate-500">RMS Tremor (Avg)</div>
+                                    <div className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                                      {sessionSummary.avgRmsG.toFixed(3)} g (
+                                      {sessionSummary.avgRms.toFixed(2)} m/s²)
+                                    </div>
+                                  </div>
+                                  <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                    <div className="text-slate-500">Average Severity (Avg)</div>
+                                    <div className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                                      {sessionSummary.avgSeverity.toFixed(2)} / 4.0 (
+                                      {sessionSummary.severityLabel})
+                                    </div>
+                                  </div>
+                                </div>
+                                <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 font-mono text-[11px]">
+                                  <div className="text-slate-500 mb-1">
+                                    Severity Distribution Across All {sessionSummary.segmentCount}{' '}
+                                    Section Windows
+                                  </div>
+                                  <div className="flex flex-wrap gap-3 text-slate-800 dark:text-slate-200">
+                                    <span>None: {sessionSummary.severityCounts[0]}</span>
+                                    <span>Mild: {sessionSummary.severityCounts[1]}</span>
+                                    <span>Moderate: {sessionSummary.severityCounts[2]}</span>
+                                    <span>Severe: {sessionSummary.severityCounts[3]}</span>
+                                    <span>Extreme: {sessionSummary.severityCounts[4]}</span>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* 4. Read Multi-Sensor Channel Summary Table */}
+                            <div>
+                              <div className="text-xs font-semibold text-slate-800 dark:text-slate-200 mb-2">
+                                Read Sensor Channels Summary (All 10 Channels ·{' '}
+                                {session.rawSampleCount || session.data.length} Samples · Sensitivity{' '}
+                                {(session.sensitivityMultiplier ?? sensitivityMultiplier).toFixed(2)}x)
+                              </div>
+                              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 font-mono text-[11px]">
+                                {(
+                                  [
+                                    ['ax', 'Accel X (m/s²)'],
+                                    ['ay', 'Accel Y (m/s²)'],
+                                    ['az', 'Accel Z (m/s²)'],
+                                    ['gx', 'Gyro X (°/s)'],
+                                    ['gy', 'Gyro Y (°/s)'],
+                                    ['gz', 'Gyro Z (°/s)'],
+                                    ['mx', 'Mag X (µT)'],
+                                    ['my', 'Mag Y (µT)'],
+                                    ['mz', 'Mag Z (µT)'],
+                                    ['fsr', 'Grip FSR'],
+                                  ] as const
+                                ).map(([key, label]) => (
+                                  <div
+                                    key={key}
+                                    className="p-2 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800"
+                                  >
+                                    <div className="text-slate-500">{label}</div>
+                                    <div className="font-semibold text-slate-900 dark:text-slate-100">
+                                      Mean: {sessionStats[key].mean} | RMS: {sessionStats[key].rms}
+                                    </div>
+                                    <div className="text-[10px] text-slate-500">
+                                      Min {sessionStats[key].min} · Max {sessionStats[key].max}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     );
                   })}

@@ -326,11 +326,11 @@ export function computePowerSpectrum(
 }
 
 /**
- * High-precision differential analysis separating Parkinsonian (4-6 Hz resting/pill-rolling +
- * bradykinetic grip force decrement) from Essential/Postural Tremor (6.5-12 Hz kinetic/action
- * coupled with active grip exertion) and voluntary motion.
+ * Internal single-segment differential analyzer over a contiguous window of sensor frames.
+ * Uses active inter-sample intervals (ignoring pen-lift gaps > 250ms) so multi-stroke drawings
+ * preserve accurate sample rate and DFT frequency alignment.
  */
-export function analyzeTremorDifferential(
+function analyzeSingleSegmentDifferential(
   dataWindow: SensorData[],
   deviceType: 'mobile' | 'pen' = 'pen',
   sensitivityMultiplier: number = 1.35
@@ -383,11 +383,23 @@ export function analyzeTremorDifferential(
   }
 
   const N = dataWindow.length;
-  const durationSec = Math.max(
+
+  // Compute true active sampling rate from consecutive active frame intervals (ignoring pen-up gaps > 250ms)
+  let activeDtSum = 0;
+  let activeDtCount = 0;
+  for (let i = 1; i < N; i++) {
+    const dt = (dataWindow[i].timestamp - dataWindow[i - 1].timestamp) / 1000;
+    if (dt > 0.001 && dt <= 0.25) {
+      activeDtSum += dt;
+      activeDtCount++;
+    }
+  }
+  const rawSpanSec = Math.max(
     0.05,
     (dataWindow[N - 1].timestamp - dataWindow[0].timestamp) / 1000
   );
-  const rawRate = (N - 1) / durationSec;
+  const durationSec = activeDtCount >= 5 ? Math.max(0.05, activeDtSum) : rawSpanSec;
+  const rawRate = activeDtCount >= 5 ? activeDtCount / activeDtSum : (N - 1) / rawSpanSec;
   const sampleRateHz = Math.max(20, Math.min(250, Number.isFinite(rawRate) ? rawRate : 50));
 
   // 1. Local trend subtraction (high-pass > 2 Hz) to isolate oscillatory tremor from gross limb translation
@@ -429,12 +441,10 @@ export function analyzeTremorDifferential(
     pronationGyro.push(Math.sqrt(gx * gx + gz * gz));
   }
 
-  // 2. Compute RMS Acceleration & Gyro RMS
+  // 2. Compute RMS Acceleration & Gyro RMS (preserve subclinical readings down to 0.002 m/s² digital floor)
   const sumSqAccel = dynAccelMag.reduce((a, b) => a + b * b, 0);
   let rms = Math.sqrt(sumSqAccel / N);
-  const noiseDeadband =
-    (deviceType === 'pen' ? 0.25 : 0.32) * Math.min(1.6, sensitivityMultiplier * 0.75);
-  if (rms < noiseDeadband) {
+  if (rms < 0.002) {
     rms = 0;
   }
   const rmsG = rms / 9.80665;
@@ -522,9 +532,9 @@ export function analyzeTremorDifferential(
 
   // 4. Pill-Rolling Rotational Dominance Index (Pronation/Supination Gyro vs Linear Accel)
   let pillRollingIndex = 0;
-  if (rms > 0.05) {
-    const rotToLinRatio = pronationRms / Math.max(0.5, rms);
-    const axisDominance = gyroRms > 0.5 ? pronationRms / gyroRms : 0.5;
+  if (rms > 0.005 || gyroRms > 0.2) {
+    const rotToLinRatio = pronationRms / Math.max(0.35, rms);
+    const axisDominance = gyroRms > 0.2 ? pronationRms / gyroRms : 0.5;
     pillRollingIndex = Math.min(
       100,
       Math.max(0, Math.round((Math.min(rotToLinRatio, 25) / 25) * 70 + axisDominance * 30))
@@ -609,7 +619,71 @@ export function analyzeTremorDifferential(
     };
   });
 
-  // 8. Unified Clinical Severity Staging (Normal / Stage 1 Mild / Stage 2 Moderate / Stage 3-4 Severe)
+  return finalizeDifferentialFromAggregates({
+    rms,
+    peakFreq,
+    gyroRms,
+    avgForce,
+    forceCv,
+    gripDecaySlope,
+    pdBandPower,
+    pdCore4to6Power,
+    etBandPower,
+    voluntaryBandPower,
+    physBandPower,
+    spectralRegularity,
+    pillRollingIndex,
+    gripForceCoherence,
+    micrographiaIndex,
+    spectrum,
+    deviceType,
+    sensitivityMultiplier,
+  });
+}
+
+function finalizeDifferentialFromAggregates(params: {
+  rms: number;
+  peakFreq: number;
+  gyroRms: number;
+  avgForce: number;
+  forceCv: number;
+  gripDecaySlope: number;
+  pdBandPower: number;
+  pdCore4to6Power: number;
+  etBandPower: number;
+  voluntaryBandPower: number;
+  physBandPower: number;
+  spectralRegularity: number;
+  pillRollingIndex: number;
+  gripForceCoherence: number;
+  micrographiaIndex: number;
+  spectrum: SpectralBin[];
+  deviceType: 'mobile' | 'pen';
+  sensitivityMultiplier: number;
+}): DifferentialAnalysisResult {
+  const {
+    rms,
+    peakFreq,
+    gyroRms,
+    avgForce,
+    forceCv,
+    gripDecaySlope,
+    pdBandPower,
+    pdCore4to6Power,
+    etBandPower,
+    voluntaryBandPower,
+    physBandPower,
+    spectralRegularity,
+    pillRollingIndex,
+    gripForceCoherence,
+    micrographiaIndex,
+    spectrum,
+    sensitivityMultiplier,
+  } = params;
+
+  const rmsG = rms / 9.80665;
+
+  // Unified Clinical Severity Staging (Normal / Stage 1 Mild / Stage 2 Moderate / Stage 3-4 Severe)
   const staging = calculateClinicalStaging(
     rms,
     peakFreq,
@@ -619,7 +693,7 @@ export function analyzeTremorDifferential(
     spectralRegularity
   );
 
-  // 9. Differential Bayesian / Ensemble Probability Scoring (PD vs ET vs Normal)
+  // Differential Bayesian / Ensemble Probability Scoring (PD vs ET vs Normal)
   let pdScore = 0;
   let etScore = 0;
   let normalScore = 15;
@@ -630,7 +704,6 @@ export function analyzeTremorDifferential(
     etScore = 4;
   } else {
     if (peakFreq >= 3.5 && peakFreq <= 6.4) {
-      // Extra weighting when locked strictly inside the 4.0-6.0 Hz Nigrostriatal PD rest window
       const coreBoost = peakFreq >= 4.0 && peakFreq <= 6.0 ? 8 : 0;
       pdScore += 48 + coreBoost + pdBandPower * 35;
       etScore += etBandPower * 25;
@@ -665,7 +738,7 @@ export function analyzeTremorDifferential(
   const etProbability = Math.round((etScore / scoreSum) * 100);
   const normalProbability = Math.max(0, 100 - pdProbability - etProbability);
 
-  // 10. Determine Phenotype & Clinical Rationale (Guaranteed consistent with severityLabel & clinicalStage)
+  // Determine Phenotype & Clinical Rationale
   let phenotype: TremorPhenotype = 'Resting Baseline';
   let clinicalRationale = '';
 
@@ -701,10 +774,10 @@ export function analyzeTremorDifferential(
     etBandPower: Number(etBandPower.toFixed(3)),
     voluntaryBandPower: Number(voluntaryBandPower.toFixed(3)),
     physBandPower: Number(physBandPower.toFixed(3)),
-    spectralRegularity,
-    pillRollingIndex,
-    gripForceCoherence,
-    micrographiaIndex,
+    spectralRegularity: Math.round(spectralRegularity),
+    pillRollingIndex: Math.round(pillRollingIndex),
+    gripForceCoherence: Math.round(gripForceCoherence),
+    micrographiaIndex: Math.round(micrographiaIndex),
     pdProbability,
     etProbability,
     normalProbability,
@@ -719,6 +792,221 @@ export function analyzeTremorDifferential(
     kinematicBracket: staging.kinematicBracket,
     clinicalRationale,
     spectrum,
+  };
+}
+
+/**
+ * High-precision differential analysis separating Parkinsonian (4-6 Hz resting/pill-rolling +
+ * bradykinetic grip force decrement) from Essential/Postural Tremor (6.5-12 Hz kinetic/action
+ * coupled with active grip exertion) and voluntary motion.
+ *
+ * When analyzing a multi-window section (N > 80 samples), computes Welch's averaged periodogram
+ * and arithmetic mean biomarkers across all active segments of the total section reading so that
+ * metrics represent the true total-section average rather than only the final second.
+ */
+export function analyzeTremorDifferential(
+  dataWindow: SensorData[],
+  deviceType: 'mobile' | 'pen' = 'pen',
+  sensitivityMultiplier: number = 1.35
+): DifferentialAnalysisResult {
+  if (!dataWindow || dataWindow.length <= 80) {
+    return analyzeSingleSegmentDifferential(dataWindow, deviceType, sensitivityMultiplier);
+  }
+
+  const N = dataWindow.length;
+  const windowSize = 80;
+  const step = 40;
+  const segments: DifferentialAnalysisResult[] = [];
+
+  for (let start = 0; start + windowSize <= N; start += step) {
+    segments.push(
+      analyzeSingleSegmentDifferential(
+        dataWindow.slice(start, start + windowSize),
+        deviceType,
+        sensitivityMultiplier
+      )
+    );
+  }
+  // Ensure the tail of the section is also sampled if not aligned on step boundary
+  if ((N - windowSize) % step !== 0 && N > windowSize) {
+    segments.push(
+      analyzeSingleSegmentDifferential(
+        dataWindow.slice(N - windowSize, N),
+        deviceType,
+        sensitivityMultiplier
+      )
+    );
+  }
+
+  if (segments.length <= 1) {
+    return analyzeSingleSegmentDifferential(dataWindow, deviceType, sensitivityMultiplier);
+  }
+
+  // Filter out trailing/leading stationary pauses (e.g. when lifting pen at the end of a drawing)
+  // if there are active movement windows during the section
+  const activeSegments = segments.filter((s) => s.rms >= 0.04);
+  const pool = activeSegments.length > 0 ? activeSegments : segments;
+  const K = pool.length;
+
+  const avg = (getter: (s: DifferentialAnalysisResult) => number) =>
+    pool.reduce((sum, s) => sum + getter(s), 0) / K;
+
+  const meanRms = avg((s) => s.rms);
+  const totalRmsWeight = pool.reduce((sum, s) => sum + Math.max(0.01, s.rms), 0);
+  const weightedPeakFreq =
+    pool.reduce((sum, s) => sum + s.dominantFreq * Math.max(0.01, s.rms), 0) /
+    Math.max(0.01, totalRmsWeight);
+
+  // Average the 8-bin PSD spectrum across all pooled segments of the section
+  const baseSpectrum = pool[0].spectrum;
+  const avgSpectrum: SpectralBin[] = baseSpectrum.map((bin, idx) => {
+    const meanPower = pool.reduce((sum, s) => sum + (s.spectrum[idx]?.power || 0), 0) / K;
+    return {
+      ...bin,
+      power: Number(meanPower.toFixed(2)),
+    };
+  });
+
+  // Compute full-section grip decay and micrographia across the entire section span
+  const fullPass = analyzeSingleSegmentDifferential(dataWindow, deviceType, sensitivityMultiplier);
+
+  return finalizeDifferentialFromAggregates({
+    rms: meanRms,
+    peakFreq: weightedPeakFreq,
+    gyroRms: avg((s) => s.gyroRms),
+    avgForce: segments.reduce((sum, s) => sum + s.avgForce, 0) / segments.length,
+    forceCv: avg((s) => s.forceCv),
+    gripDecaySlope: fullPass.gripDecaySlope,
+    pdBandPower: avg((s) => s.pdBandPower),
+    pdCore4to6Power: avg((s) => s.pdCore4to6Power),
+    etBandPower: avg((s) => s.etBandPower),
+    voluntaryBandPower: avg((s) => s.voluntaryBandPower),
+    physBandPower: avg((s) => s.physBandPower),
+    spectralRegularity: avg((s) => s.spectralRegularity),
+    pillRollingIndex: avg((s) => s.pillRollingIndex),
+    gripForceCoherence: avg((s) => s.gripForceCoherence),
+    micrographiaIndex: Math.max(
+      fullPass.micrographiaIndex,
+      Math.round(avg((s) => s.micrographiaIndex))
+    ),
+    spectrum: avgSpectrum,
+    deviceType,
+    sensitivityMultiplier,
+  });
+}
+
+export interface DatasetSectionSummary {
+  totalPoints: number;
+  durationSec: number;
+  segmentCount: number;
+  avgRms: number; // m/s² (Total Section Average)
+  avgRmsG: number; // g (Total Section Average)
+  avgFrequency: number; // Hz (Total Section Average)
+  avgSeverity: number; // 0.0 - 4.0 MDS-UPDRS III (Total Section Average)
+  severityLabel: 'Normal' | 'Mild' | 'Moderate' | 'Severe';
+  stage: string; // 'Normal' | 'Stage 1' | 'Stage 2' | 'Stage 3' | 'Stage 4'
+  severityCounts: [number, number, number, number, number]; // [None, Mild, Moderate, Severe, Extreme]
+  differential: DifferentialAnalysisResult;
+}
+
+/**
+ * Computes the Dataset Analysis Summary as the true average across all segments
+ * of the total section reading (never just the last-second output).
+ */
+export function computeDatasetSectionSummary(
+  data: SensorData[],
+  deviceType: 'mobile' | 'pen' = 'pen',
+  sensitivityMultiplier: number = 1.35
+): DatasetSectionSummary {
+  const differential = analyzeTremorDifferential(data, deviceType, sensitivityMultiplier);
+
+  if (!Array.isArray(data) || data.length === 0) {
+    return {
+      totalPoints: 0,
+      durationSec: 0,
+      segmentCount: 0,
+      avgRms: 0,
+      avgRmsG: 0,
+      avgFrequency: 0,
+      avgSeverity: 0,
+      severityLabel: 'Normal',
+      stage: 'Normal',
+      severityCounts: [0, 0, 0, 0, 0],
+      differential,
+    };
+  }
+
+  const N = data.length;
+  let activeDtSum = 0;
+  let activeDtCount = 0;
+  for (let i = 1; i < N; i++) {
+    const dt = (data[i].timestamp - data[i - 1].timestamp) / 1000;
+    if (dt > 0.001 && dt <= 0.25) {
+      activeDtSum += dt;
+      activeDtCount++;
+    }
+  }
+  const rawSpanSec =
+    N > 1 ? Math.max(0.1, (data[N - 1].timestamp - data[0].timestamp) / 1000) : 0;
+  const durationSec = Number((activeDtCount >= 5 ? activeDtSum : rawSpanSec || N / 50).toFixed(2));
+
+  const segmentSize = Math.min(80, Math.max(20, Math.floor(N / Math.min(10, Math.max(1, Math.floor(N / 40))))));
+  const step = Math.max(15, Math.floor(segmentSize / 2));
+  const segmentResults: DifferentialAnalysisResult[] = [];
+
+  if (N < 24) {
+    segmentResults.push(differential);
+  } else {
+    for (let i = 0; i < N; i += step) {
+      const slice = data.slice(i, i + segmentSize);
+      if (slice.length >= 12) {
+        segmentResults.push(
+          analyzeSingleSegmentDifferential(slice, deviceType, sensitivityMultiplier)
+        );
+      }
+      if (i + segmentSize >= N) break;
+    }
+  }
+
+  if (segmentResults.length === 0) {
+    segmentResults.push(differential);
+  }
+
+  const severityCounts: [number, number, number, number, number] = [0, 0, 0, 0, 0];
+  for (const seg of segmentResults) {
+    const bucket = Math.max(0, Math.min(4, Math.round(seg.updrsScore)));
+    severityCounts[bucket]++;
+  }
+
+  const activePool = segmentResults.filter((s) => s.rms >= 0.04);
+  const avgPool = activePool.length > 0 ? activePool : segmentResults;
+  const M = avgPool.length;
+
+  const avgRms = Number((avgPool.reduce((acc, s) => acc + s.rms, 0) / M).toFixed(3));
+  const avgRmsG = Number((avgRms / 9.80665).toFixed(4));
+  const totalWeight = avgPool.reduce((acc, s) => acc + Math.max(0.01, s.rms), 0);
+  const avgFrequency = Number(
+    (
+      avgPool.reduce((acc, s) => acc + s.dominantFreq * Math.max(0.01, s.rms), 0) /
+      Math.max(0.01, totalWeight)
+    ).toFixed(1)
+  );
+  const avgSeverity = Number(
+    (avgPool.reduce((acc, s) => acc + s.updrsScore, 0) / M).toFixed(2)
+  );
+
+  return {
+    totalPoints: N,
+    durationSec,
+    segmentCount: segmentResults.length,
+    avgRms,
+    avgRmsG,
+    avgFrequency,
+    avgSeverity,
+    severityLabel: differential.severityLabel,
+    stage: differential.clinicalStage,
+    severityCounts,
+    differential,
   };
 }
 
@@ -827,3 +1115,68 @@ export function downsampleTelemetry(data: SensorData[], maxPoints: number = 400)
   }
   return result;
 }
+
+export interface SensorAxisStat {
+  min: number;
+  max: number;
+  mean: number;
+  rms: number;
+}
+
+export interface SensorChannelStats {
+  ax: SensorAxisStat;
+  ay: SensorAxisStat;
+  az: SensorAxisStat;
+  gx: SensorAxisStat;
+  gy: SensorAxisStat;
+  gz: SensorAxisStat;
+  mx: SensorAxisStat;
+  my: SensorAxisStat;
+  mz: SensorAxisStat;
+  fsr: SensorAxisStat;
+}
+
+export function computeSensorChannelStats(data: SensorData[]): SensorChannelStats {
+  const zeroStat: SensorAxisStat = { min: 0, max: 0, mean: 0, rms: 0 };
+  if (!Array.isArray(data) || data.length === 0) {
+    return {
+      ax: { ...zeroStat },
+      ay: { ...zeroStat },
+      az: { ...zeroStat },
+      gx: { ...zeroStat },
+      gy: { ...zeroStat },
+      gz: { ...zeroStat },
+      mx: { ...zeroStat },
+      my: { ...zeroStat },
+      mz: { ...zeroStat },
+      fsr: { ...zeroStat },
+    };
+  }
+
+  const keys = ['ax', 'ay', 'az', 'gx', 'gy', 'gz', 'mx', 'my', 'mz', 'fsr'] as const;
+  const stats = {} as SensorChannelStats;
+  const N = data.length;
+
+  for (const key of keys) {
+    let min = Infinity;
+    let max = -Infinity;
+    let sum = 0;
+    let sumSq = 0;
+    for (let i = 0; i < N; i++) {
+      const val = Number(data[i][key] || 0);
+      if (val < min) min = val;
+      if (val > max) max = val;
+      sum += val;
+      sumSq += val * val;
+    }
+    stats[key] = {
+      min: Number(min.toFixed(3)),
+      max: Number(max.toFixed(3)),
+      mean: Number((sum / N).toFixed(3)),
+      rms: Number(Math.sqrt(sumSq / N).toFixed(3)),
+    };
+  }
+
+  return stats;
+}
+

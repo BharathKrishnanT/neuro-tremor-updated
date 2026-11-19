@@ -5,11 +5,32 @@ import { useLanguage } from '../lib/i18n';
 
 export type CanvasDrawMode = 'spiral' | 'freedraw';
 
+export interface DrawingPoint {
+  x: number;
+  y: number;
+  pressure: number;
+  t: number;
+}
+
+export interface DrawingStroke {
+  mode: CanvasDrawMode;
+  points: DrawingPoint[];
+  canvasWidth: number;
+  canvasHeight: number;
+}
+
 export interface TouchPadCanvasProps {
   onData: (data: SensorData) => void;
   mode?: 'touch' | 'combined';
   onTouchUpdate?: (x: number, y: number, pressure: number, syntheticFrame?: SensorData) => void;
   onDrawingStateChange?: (isDrawing: boolean) => void;
+  onStrokesChange?: (
+    strokes: DrawingStroke[],
+    canvasMode: CanvasDrawMode,
+    canvasWidth: number,
+    canvasHeight: number
+  ) => void;
+  replayStrokes?: DrawingStroke[] | null;
   onClearData?: () => void;
   onSaveDrawingSession?: () => void;
   isRecording?: boolean;
@@ -17,11 +38,101 @@ export interface TouchPadCanvasProps {
   sampleCount?: number;
 }
 
+export function renderDrawingToCanvas(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  activeMode: CanvasDrawMode,
+  strokes: DrawingStroke[] = []
+) {
+  ctx.clearRect(0, 0, w, h);
+
+  // Subtle background coordinate grid for clinical spatial reference
+  ctx.strokeStyle = 'rgba(51, 65, 85, 0.35)';
+  ctx.lineWidth = 1;
+  const gridStep = 32;
+  ctx.beginPath();
+  for (let gx = gridStep; gx < w; gx += gridStep) {
+    ctx.moveTo(gx, 0);
+    ctx.lineTo(gx, h);
+  }
+  for (let gy = gridStep; gy < h; gy += gridStep) {
+    ctx.moveTo(0, gy);
+    ctx.lineTo(w, gy);
+  }
+  ctx.stroke();
+
+  if (activeMode === 'spiral') {
+    // Archimedes Spiral Reference Template
+    ctx.strokeStyle = '#475569';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    const scale = w > 1000 ? 8 : 5;
+    for (let i = 0; i < 500; i++) {
+      const angle = 0.1 * i;
+      const x = w / 2 + (1 + angle) * Math.cos(angle) * scale;
+      const y = h / 2 + (1 + angle) * Math.sin(angle) * scale;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Center origin target marker
+    ctx.fillStyle = '#38bdf8';
+    ctx.beginPath();
+    ctx.arc(w / 2, h / 2, 3, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    // Free-Draw Center Crosshair Axes
+    ctx.strokeStyle = 'rgba(71, 85, 105, 0.55)';
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(w / 2, 0);
+    ctx.lineTo(w / 2, h);
+    ctx.moveTo(0, h / 2);
+    ctx.lineTo(w, h / 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '12px "IBM Plex Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(
+    activeMode === 'spiral'
+      ? 'GUIDED ARCHIMEDES SPIRAL · TRACE FROM CENTER OUTWARD'
+      : 'BLANK FREE-DRAW WORKSPACE · WRITE OR DRAW FREELY TO MEASURE TREMOR',
+    w / 2,
+    24
+  );
+
+  // Render any existing or replayed user strokes
+  for (const stroke of strokes) {
+    if (!stroke.points || stroke.points.length === 0) continue;
+    const scaleX = stroke.canvasWidth > 0 ? w / stroke.canvasWidth : 1;
+    const scaleY = stroke.canvasHeight > 0 ? h / stroke.canvasHeight : 1;
+    ctx.beginPath();
+    stroke.points.forEach((pt, idx) => {
+      const px = pt.x * scaleX;
+      const py = pt.y * scaleY;
+      if (idx === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    });
+    ctx.strokeStyle = '#10b981';
+    ctx.lineWidth = 2.2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+  }
+}
+
 export function TouchPadCanvas({
   onData,
   mode = 'touch',
   onTouchUpdate,
   onDrawingStateChange,
+  onStrokesChange,
+  replayStrokes,
   onClearData,
   onSaveDrawingSession,
   isRecording = false,
@@ -35,74 +146,32 @@ export function TouchPadCanvas({
   const [hasDrawn, setHasDrawn] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
+  const strokesRef = useRef<DrawingStroke[]>([]);
+  const currentStrokeRef = useRef<DrawingStroke | null>(null);
   const lastPos = useRef<{ x: number; y: number; t: number } | null>(null);
   const lastVel = useRef<{ vx: number; vy: number; ax: number; ay: number } | null>(null);
 
-  const drawBackgroundGuide = useCallback(
-    (ctx: CanvasRenderingContext2D, w: number, h: number, activeMode: CanvasDrawMode) => {
-      ctx.clearRect(0, 0, w, h);
-
-      // Subtle background coordinate grid for clinical spatial reference
-      ctx.strokeStyle = 'rgba(51, 65, 85, 0.35)';
-      ctx.lineWidth = 1;
-      const gridStep = 32;
-      ctx.beginPath();
-      for (let gx = gridStep; gx < w; gx += gridStep) {
-        ctx.moveTo(gx, 0);
-        ctx.lineTo(gx, h);
+  const redrawAll = useCallback(
+    (activeMode: CanvasDrawMode = canvasMode, strokes: DrawingStroke[] = strokesRef.current) => {
+      const canvas = canvasRef.current;
+      const ctx = canvas?.getContext('2d');
+      if (ctx && canvas) {
+        renderDrawingToCanvas(ctx, canvas.width, canvas.height, activeMode, strokes);
       }
-      for (let gy = gridStep; gy < h; gy += gridStep) {
-        ctx.moveTo(0, gy);
-        ctx.lineTo(w, gy);
-      }
-      ctx.stroke();
-
-      if (activeMode === 'spiral') {
-        // Archimedes Spiral Reference Template
-        ctx.strokeStyle = '#475569';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        const scale = w > 1000 ? 8 : 5;
-        for (let i = 0; i < 500; i++) {
-          const angle = 0.1 * i;
-          const x = w / 2 + (1 + angle) * Math.cos(angle) * scale;
-          const y = h / 2 + (1 + angle) * Math.sin(angle) * scale;
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }
-        ctx.stroke();
-
-        // Center origin target marker
-        ctx.fillStyle = '#38bdf8';
-        ctx.beginPath();
-        ctx.arc(w / 2, h / 2, 3, 0, Math.PI * 2);
-        ctx.fill();
-      } else {
-        // Free-Draw Center Crosshair Axes
-        ctx.strokeStyle = 'rgba(71, 85, 105, 0.55)';
-        ctx.setLineDash([4, 4]);
-        ctx.beginPath();
-        ctx.moveTo(w / 2, 0);
-        ctx.lineTo(w / 2, h);
-        ctx.moveTo(0, h / 2);
-        ctx.lineTo(w, h / 2);
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = '12px "IBM Plex Mono", monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText(
-        activeMode === 'spiral'
-          ? 'GUIDED ARCHIMEDES SPIRAL · TRACE FROM CENTER OUTWARD'
-          : 'BLANK FREE-DRAW WORKSPACE · WRITE OR DRAW FREELY TO MEASURE TREMOR',
-        w / 2,
-        24
-      );
     },
-    []
+    [canvasMode]
   );
+
+  // Sync replayStrokes if a saved session is replayed
+  useEffect(() => {
+    if (replayStrokes && replayStrokes.length > 0) {
+      const replayMode = replayStrokes[0].mode || 'spiral';
+      setCanvasMode(replayMode);
+      strokesRef.current = replayStrokes;
+      setHasDrawn(true);
+      redrawAll(replayMode, replayStrokes);
+    }
+  }, [replayStrokes, redrawAll]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -118,7 +187,9 @@ export function TouchPadCanvas({
         canvas.height = rect.height;
 
         const ctx = canvas.getContext('2d');
-        if (ctx) drawBackgroundGuide(ctx, canvas.width, canvas.height, canvasMode);
+        if (ctx) {
+          renderDrawingToCanvas(ctx, canvas.width, canvas.height, canvasMode, strokesRef.current);
+        }
       }
     };
 
@@ -133,20 +204,23 @@ export function TouchPadCanvas({
     handleResize();
 
     return () => observer.disconnect();
-  }, [isFullscreen, canvasMode, drawBackgroundGuide]);
+  }, [isFullscreen, canvasMode]);
 
   const resetCanvasSurface = useCallback(
     (targetMode: CanvasDrawMode = canvasMode) => {
       setHasDrawn(false);
       setIsDrawing(false);
+      strokesRef.current = [];
+      currentStrokeRef.current = null;
       onDrawingStateChange?.(false);
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext('2d');
       if (ctx && canvas) {
-        drawBackgroundGuide(ctx, canvas.width, canvas.height, targetMode);
+        renderDrawingToCanvas(ctx, canvas.width, canvas.height, targetMode, []);
+        onStrokesChange?.([], targetMode, canvas.width, canvas.height);
       }
     },
-    [canvasMode, drawBackgroundGuide, onDrawingStateChange]
+    [canvasMode, onDrawingStateChange, onStrokesChange]
   );
 
   const handleSwitchMode = (nextMode: CanvasDrawMode) => {
@@ -179,9 +253,27 @@ export function TouchPadCanvas({
     lastPos.current = { x: e.clientX, y: e.clientY, t: now };
     lastVel.current = { vx: 0, vy: 0, ax: 0, ay: 0 };
 
-    const ctx = canvasRef.current?.getContext('2d');
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    const { x, y } = getCanvasCoordinates(e);
+    const pressure = e.pressure !== undefined && e.pressure > 0 ? e.pressure * 4095 : 2048;
+
+    const newStroke: DrawingStroke = {
+      mode: canvasMode,
+      canvasWidth: canvas?.width || 800,
+      canvasHeight: canvas?.height || 320,
+      points: [{ x: Number(x.toFixed(1)), y: Number(y.toFixed(1)), pressure: Math.round(pressure), t: now }],
+    };
+    currentStrokeRef.current = newStroke;
+    strokesRef.current = [...strokesRef.current, newStroke];
+    onStrokesChange?.(
+      strokesRef.current,
+      canvasMode,
+      canvas?.width || 800,
+      canvas?.height || 320
+    );
+
     if (ctx) {
-      const { x, y } = getCanvasCoordinates(e);
       ctx.beginPath();
       ctx.moveTo(x, y);
     }
@@ -217,6 +309,22 @@ export function TouchPadCanvas({
 
     const pressure = e.pressure !== undefined && e.pressure > 0 ? e.pressure * 4095 : 2048;
     const { x, y } = getCanvasCoordinates(e);
+
+    if (currentStrokeRef.current) {
+      currentStrokeRef.current.points.push({
+        x: Number(x.toFixed(1)),
+        y: Number(y.toFixed(1)),
+        pressure: Math.round(pressure),
+        t: now,
+      });
+      const canvas = canvasRef.current;
+      onStrokesChange?.(
+        strokesRef.current,
+        canvasMode,
+        canvas?.width || 800,
+        canvas?.height || 320
+      );
+    }
 
     const gx = Number(Math.max(-180, Math.min(180, vy * 120)).toFixed(2));
     const gy = Number(Math.max(-180, Math.min(180, -vx * 120)).toFixed(2));
@@ -262,7 +370,15 @@ export function TouchPadCanvas({
     if (isDrawing) {
       setIsDrawing(false);
       onDrawingStateChange?.(false);
+      const canvas = canvasRef.current;
+      onStrokesChange?.(
+        strokesRef.current,
+        canvasMode,
+        canvas?.width || 800,
+        canvas?.height || 320
+      );
     }
+    currentStrokeRef.current = null;
     lastPos.current = null;
     lastVel.current = null;
   };
@@ -384,7 +500,7 @@ export function TouchPadCanvas({
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2 flex-shrink-0">
         <div className="text-xs text-slate-500 dark:text-slate-400 font-mono">
           {sampleCount >= 12
-            ? `Ready to save recorded section (${sampleCount} active drawing samples)`
+            ? `Ready to save complete section (${sampleCount} sensor pts + ${strokesRef.current.length} drawing ${strokesRef.current.length === 1 ? 'stroke' : 'strokes'})`
             : `Draw on the ${canvasMode === 'spiral' ? 'spiral' : 'free-draw'} canvas (min 12 samples) to record a section`}
         </div>
 
@@ -422,7 +538,7 @@ export function TouchPadCanvas({
               }}
               disabled={sampleCount < 12}
               className="px-3.5 py-1.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors rounded-md text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
-              title="Save current drawing telemetry as a recorded section to update Recovery Rate & Graph"
+              title="Save drawing, all raw sensor readings, and all calculated tremor biomarkers as a recorded section"
             >
               <Save size={13} />
               <span>Save Drawing Session</span>

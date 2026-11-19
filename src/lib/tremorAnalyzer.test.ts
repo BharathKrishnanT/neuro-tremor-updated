@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   analyzeTremorDifferential,
   calculateClinicalStaging,
+  computeDatasetSectionSummary,
   computeRecoveryAnalysis,
   generateSimulatedSample,
   downsampleTelemetry,
@@ -120,13 +121,45 @@ test('Essential / Postural tremor (8.5 Hz + active kinetic grip) is accurately d
   assert.ok(res.etBandPower > res.pdBandPower);
 });
 
-test('Physiological baseline is classified as Physiological / Subclinical with UPDRS 0', () => {
+test('Physiological baseline is classified as Physiological / Subclinical with UPDRS 0 while retaining non-zero subclinical RMS and frequency', () => {
   const normWindow = generateWindow('physiological', 100, 50);
   const res = analyzeTremorDifferential(normWindow, 'pen', 1.35);
 
   assert.equal(res.phenotype, 'Physiological / Subclinical');
   assert.equal(res.updrsScore, 0);
   assert.equal(res.severityLabel, 'Normal');
+  assert.ok(res.rms > 0, `Expected non-zero subclinical RMS, got ${res.rms}`);
+  assert.ok(res.dominantFreq > 0, `Expected non-zero subclinical dominant frequency, got ${res.dominantFreq}`);
+});
+
+test('computeDatasetSectionSummary and analyzeTremorDifferential calculate section-wide average across all windows and ignore trailing stationary pause', () => {
+  const activePd = generateWindow('pd_resting', 240, 50);
+  const lastTs = activePd[activePd.length - 1].timestamp;
+  const trailingStillness: SensorData[] = [];
+  for (let i = 1; i <= 80; i++) {
+    trailingStillness.push({
+      ax: 0,
+      ay: 0,
+      az: 9.81,
+      gx: 0,
+      gy: 0,
+      gz: 0,
+      mx: 28,
+      my: -14,
+      mz: 41,
+      fsr: 3403,
+      timestamp: lastTs + i * 20,
+    });
+  }
+  const fullSection = [...activePd, ...trailingStillness];
+  const summary = computeDatasetSectionSummary(fullSection, 'pen', 1.35);
+
+  assert.equal(summary.totalPoints, 320);
+  assert.ok(summary.segmentCount >= 2);
+  assert.ok(summary.avgRms > 1.5, `Expected section average RMS > 1.5 m/s², got ${summary.avgRms}`);
+  assert.ok(summary.avgRmsG > 0.15, `Expected section average RMS > 0.15 g, got ${summary.avgRmsG}`);
+  assert.ok(summary.avgFrequency >= 4.0 && summary.avgFrequency <= 6.0, `Expected 4-6Hz average frequency, got ${summary.avgFrequency}`);
+  assert.equal(summary.differential.phenotype, 'Parkinsonian Tremor (PD)');
 });
 
 test('downsampleTelemetry bounds large arrays to maxPoints while preserving start and end', () => {
@@ -198,5 +231,6 @@ test('ESP32-S3 Mini (ICM-20948 + FSR) 10-col and 13-col CSV lines with IMU_Statu
   assert.equal(esp13Col.mz, 38.75);
   assert.equal(esp13Col.fsr, 445);
 });
+
 
 
