@@ -31,6 +31,9 @@ export interface TouchPadCanvasProps {
     canvasHeight: number
   ) => void;
   replayStrokes?: DrawingStroke[] | null;
+  clearNonce?: number;
+  isReplaying?: boolean;
+  onClearReplay?: () => void;
   onClearData?: () => void;
   onSaveDrawingSession?: () => void;
   isRecording?: boolean;
@@ -133,6 +136,9 @@ export function TouchPadCanvas({
   onDrawingStateChange,
   onStrokesChange,
   replayStrokes,
+  clearNonce = 0,
+  isReplaying = false,
+  onClearReplay,
   onClearData,
   onSaveDrawingSession,
   isRecording = false,
@@ -147,6 +153,7 @@ export function TouchPadCanvas({
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   const strokesRef = useRef<DrawingStroke[]>([]);
+  const hadReplayRef = useRef<boolean>(false);
   const currentStrokeRef = useRef<DrawingStroke | null>(null);
   const lastPos = useRef<{ x: number; y: number; t: number } | null>(null);
   const lastVel = useRef<{ vx: number; vy: number; ax: number; ay: number } | null>(null);
@@ -162,16 +169,36 @@ export function TouchPadCanvas({
     [canvasMode]
   );
 
-  // Sync replayStrokes if a saved session is replayed
+  // Sync replayStrokes when a saved session is replayed, and wipe the canvas cleanly when replay is cleared
   useEffect(() => {
     if (replayStrokes && replayStrokes.length > 0) {
+      hadReplayRef.current = true;
       const replayMode = replayStrokes[0].mode || 'spiral';
       setCanvasMode(replayMode);
       strokesRef.current = replayStrokes;
       setHasDrawn(true);
       redrawAll(replayMode, replayStrokes);
+    } else if (hadReplayRef.current) {
+      hadReplayRef.current = false;
+      strokesRef.current = [];
+      currentStrokeRef.current = null;
+      setIsDrawing(false);
+      setHasDrawn(false);
+      redrawAll(canvasMode, []);
     }
-  }, [replayStrokes, redrawAll]);
+  }, [replayStrokes, canvasMode, redrawAll]);
+
+  // Wipe canvas whenever an external clear/reset is triggered (e.g., Clear Replay or Clear Data)
+  useEffect(() => {
+    if (clearNonce > 0) {
+      hadReplayRef.current = false;
+      strokesRef.current = [];
+      currentStrokeRef.current = null;
+      setIsDrawing(false);
+      setHasDrawn(false);
+      redrawAll(canvasMode, []);
+    }
+  }, [clearNonce, canvasMode, redrawAll]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -409,7 +436,9 @@ export function TouchPadCanvas({
                   : 'text-amber-700 dark:text-amber-400'
               }`}
             >
-              {isDrawing
+              {isReplaying || (replayStrokes && replayStrokes.length > 0)
+                ? `● Replay Preview (${strokesRef.current.length} saved ${strokesRef.current.length === 1 ? 'stroke' : 'strokes'})`
+                : isDrawing
                 ? `● Measuring Active Stroke (${sampleCount} pts)`
                 : sampleCount > 0
                 ? `○ Stroke Paused (${sampleCount} pts captured — draw to continue or save section)`
@@ -417,7 +446,9 @@ export function TouchPadCanvas({
             </span>
           </div>
           <p className="text-slate-500 dark:text-slate-400 text-xs mt-0.5">
-            Tremor measurement activates strictly while you draw on the trackpad canvas below and pauses when the pen lifts.
+            {isReplaying || (replayStrokes && replayStrokes.length > 0)
+              ? 'Showing replayed session drawing. Click Clear Replay to reset the canvas and return to live testing.'
+              : 'Tremor measurement activates strictly while you draw on the trackpad canvas below and pauses when the pen lifts.'}
           </p>
         </div>
 
@@ -542,6 +573,20 @@ export function TouchPadCanvas({
             >
               <Save size={13} />
               <span>Save Drawing Session</span>
+            </button>
+          )}
+
+          {(isReplaying || (replayStrokes && replayStrokes.length > 0)) && onClearReplay && (
+            <button
+              type="button"
+              onClick={() => {
+                resetCanvasSurface(canvasMode);
+                onClearReplay();
+              }}
+              className="px-3 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:hover:bg-amber-900/50 dark:text-amber-300 border border-amber-200 dark:border-amber-800 transition-colors rounded-md text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              <Trash2 size={13} />
+              <span>Clear Replay</span>
             </button>
           )}
 

@@ -304,11 +304,16 @@ function App() {
   const isInferenceRunning = useRef(false);
   const lastInferenceTime = useRef<number>(0);
   const [loadedDataset, setLoadedDataset] = useState<SensorData[] | null>(null);
+  const [replayLabel, setReplayLabel] = useState<string | null>(null);
   const [playbackIndex, setPlaybackIndex] = useState(0);
   const [isPlayingDataset, setIsPlayingDataset] = useState(false);
   const [isPausedDataset, setIsPausedDataset] = useState(false);
   const [isPausedRealTime, setIsPausedRealTime] = useState(false);
+  const [canvasResetNonce, setCanvasResetNonce] = useState(0);
   const isPausedRealTimeRef = useRef(false);
+  const isPlayingDatasetRef = useRef(false);
+  const playbackDatasetRef = useRef<SensorData[]>([]);
+  const playbackIndexRef = useRef(0);
   const [offsets, setOffsets] = useState<CalibrationOffsets>(() => {
     try {
       // Clear stale cross-session calibration offsets so sensors always start with true physical units
@@ -441,7 +446,7 @@ function App() {
       const newPoints = [...uiBuffer.current];
       uiBuffer.current = [];
 
-      if (isPausedRealTimeRef.current) return;
+      if (isPausedRealTimeRef.current && !isPlayingDatasetRef.current) return;
 
       setData((prev) => {
         const updated = [...prev, ...newPoints];
@@ -450,7 +455,7 @@ function App() {
         }
         return updated;
       });
-      if (sectionDataBuffer.current.length > 0) {
+      if (!isPlayingDatasetRef.current && sectionDataBuffer.current.length > 0) {
         setSectionData([...sectionDataBuffer.current]);
       }
     }, 100);
@@ -555,13 +560,16 @@ function App() {
 
   // Compute Differential Analysis & Metrics as the average of the total section reading (never just the last-second window)
   const activeSectionFrames = React.useMemo(() => {
+    if (isPlayingDataset && loadedDataset && loadedDataset.length > 0) {
+      return loadedDataset.slice(0, Math.min(loadedDataset.length, Math.max(12, playbackIndex + 1)));
+    }
+    if (loadedDataset && loadedDataset.length > 0) {
+      return loadedDataset;
+    }
     if (sectionData.length >= 12) return sectionData;
     if (data.length >= 12) return data;
-    if (recordedSessions.length > 0 && recordedSessions[0].data.length >= 12) {
-      return recordedSessions[0].data;
-    }
     return data;
-  }, [sectionData, data, recordedSessions]);
+  }, [isPlayingDataset, loadedDataset, playbackIndex, sectionData, data]);
 
   const differential = React.useMemo(() => {
     const deviceType = connectionType === 'mobile' ? 'mobile' : 'pen';
@@ -629,6 +637,11 @@ function App() {
         calibrationBuffer.current.push(enriched);
       }
 
+      // Ignore live hardware/sim frames while dataset playback is active or real-time testing is paused/stopped
+      if (isPlayingDatasetRef.current || isPausedRealTimeRef.current) {
+        return;
+      }
+
       // Gate pen and trackpad connections so tremor measurement only runs while actively drawing on the canvas
       const isPenOrTrackpadConnection =
         connectionType === 'ble' ||
@@ -639,7 +652,7 @@ function App() {
         connectionType === 'serial-touch' ||
         connectionType === 'wifi-touch';
 
-      if (isPenOrTrackpadConnection && !isDrawingOnCanvasRef.current && !isPlayingDataset) {
+      if (isPenOrTrackpadConnection && !isDrawingOnCanvasRef.current) {
         return;
       }
 
@@ -776,11 +789,7 @@ function App() {
     try {
       setPermissionError(false);
       await serialService.connect();
-      isDrawingOnCanvasRef.current = false;
-      setIsDrawingOnCanvas(false);
-      uiBuffer.current = [];
-      recordingBuffer.current = [];
-      setData([]);
+      clearReplayAndPlayback();
       setIsConnected(true);
       setConnectionType(combined ? 'serial-touch' : 'serial');
       setIsSimulating(false);
@@ -801,11 +810,7 @@ function App() {
       setPermissionError(false);
       setBleStatusText('Connecting to Bluetooth...');
       await bleService.connect({ scanAll });
-      isDrawingOnCanvasRef.current = false;
-      setIsDrawingOnCanvas(false);
-      uiBuffer.current = [];
-      recordingBuffer.current = [];
-      setData([]);
+      clearReplayAndPlayback();
       setIsConnected(true);
       setConnectionType(combined ? 'ble-touch' : 'ble');
       setIsSimulating(false);
@@ -831,6 +836,7 @@ function App() {
     try {
       setPermissionError(false);
       await mobileSensorService.start();
+      clearReplayAndPlayback();
       setIsConnected(true);
       setConnectionType('mobile');
       setIsSimulating(false);
@@ -842,85 +848,244 @@ function App() {
     }
   };
 
-  const disconnect = async () => {
-    if (connectionType && connectionType.includes('serial')) await serialService.disconnect();
-    if (connectionType && connectionType.includes('ble')) await bleService.disconnect();
-    if (connectionType && connectionType.includes('wifi')) wifiService.disconnect();
-    if (connectionType === 'mobile') mobileSensorService.stop();
-    if (isSimulating) {
-      if (simulationInterval.current) clearInterval(simulationInterval.current);
-      setIsSimulating(false);
-    }
-    stopDatasetPlayback();
-    isDrawingOnCanvasRef.current = false;
-    setIsDrawingOnCanvas(false);
-    setIsConnected(false);
-    setConnectionType(null);
-    setBatteryLevel(null);
-  };
-
   const stopDatasetPlayback = useCallback(() => {
     if (playbackInterval.current) {
       clearInterval(playbackInterval.current);
       playbackInterval.current = null;
     }
+    uiBuffer.current = [];
+    isPlayingDatasetRef.current = false;
     setIsPlayingDataset(false);
     setIsPausedDataset(false);
   }, []);
 
-  const pauseDatasetPlayback = () => {
+  const disconnect = async () => {
+    if (connectionType && connectionType.includes('serial')) await serialService.disconnect();
+    if (connectionType && connectionType.includes('ble')) await bleService.disconnect();
+    if (connectionType && connectionType.includes('wifi')) wifiService.disconnect();
+    if (connectionType === 'mobile') mobileSensorService.stop();
+    if (simulationInterval.current) {
+      clearInterval(simulationInterval.current);
+      simulationInterval.current = null;
+    }
+    setIsSimulating(false);
+    stopDatasetPlayback();
+    uiBuffer.current = [];
+    isPausedRealTimeRef.current = false;
+    setIsPausedRealTime(false);
+    isDrawingOnCanvasRef.current = false;
+    setIsDrawingOnCanvas(false);
+    setIsRecording(false);
+    setIsConnected(false);
+    setConnectionType(null);
+    setBatteryLevel(null);
+  };
+
+  const pushPlaybackFrame = useCallback((frame: SensorData) => {
+    const enriched = enrichSensorFrame(frame);
+    uiBuffer.current.push(enriched);
+    if (
+      Math.abs(enriched.gx) > 0.01 ||
+      Math.abs(enriched.gy) > 0.01 ||
+      Math.abs(enriched.gz) > 0.01
+    ) {
+      setHasGyro(true);
+    }
+    if (
+      Math.abs(enriched.mx) > 0.01 ||
+      Math.abs(enriched.my) > 0.01 ||
+      Math.abs(enriched.mz) > 0.01
+    ) {
+      setHasMag(true);
+    }
+  }, []);
+
+  const runPlaybackLoop = useCallback(
+    (dataset: SensorData[], startIndex: number) => {
+      if (playbackInterval.current) {
+        clearInterval(playbackInterval.current);
+        playbackInterval.current = null;
+      }
+      if (!dataset || dataset.length === 0) {
+        stopDatasetPlayback();
+        return;
+      }
+
+      playbackDatasetRef.current = dataset;
+      let index = Math.max(0, Math.min(startIndex, dataset.length - 1));
+      playbackIndexRef.current = index;
+      setPlaybackIndex(index);
+      isPlayingDatasetRef.current = true;
+      setIsPlayingDataset(true);
+      setIsPausedDataset(false);
+
+      // Adaptive step keeps long datasets responsive while playing short sessions at ~50Hz
+      const step = dataset.length > 600 ? Math.ceil(dataset.length / 400) : 1;
+      const intervalMs = 20;
+
+      playbackInterval.current = setInterval(() => {
+        const ds = playbackDatasetRef.current;
+        if (!ds || ds.length === 0) {
+          stopDatasetPlayback();
+          return;
+        }
+        const nextEnd = Math.min(ds.length, index + step);
+        for (let i = index; i < nextEnd; i++) {
+          pushPlaybackFrame(ds[i]);
+        }
+        index = nextEnd;
+        const lastProcessed = Math.min(ds.length - 1, index - 1);
+        playbackIndexRef.current = lastProcessed;
+        setPlaybackIndex(lastProcessed);
+
+        if (index >= ds.length) {
+          if (playbackInterval.current) {
+            clearInterval(playbackInterval.current);
+            playbackInterval.current = null;
+          }
+          // Flush final frames cleanly before exiting playback mode
+          if (uiBuffer.current.length > 0) {
+            const tail = [...uiBuffer.current];
+            uiBuffer.current = [];
+            setData((prev) => {
+              const updated = [...prev, ...tail];
+              return updated.length > MAX_POINTS
+                ? updated.slice(updated.length - MAX_POINTS)
+                : updated;
+            });
+          }
+          isPlayingDatasetRef.current = false;
+          setIsPlayingDataset(false);
+          setIsPausedDataset(false);
+        }
+      }, intervalMs);
+    },
+    [pushPlaybackFrame, stopDatasetPlayback]
+  );
+
+  const pauseDatasetPlayback = useCallback(() => {
     if (playbackInterval.current) {
       clearInterval(playbackInterval.current);
       playbackInterval.current = null;
     }
     setIsPausedDataset(true);
-  };
+  }, []);
 
-  const resumeDatasetPlayback = () => {
-    if (!loadedDataset) return;
-    setIsPausedDataset(false);
-
-    let index = playbackIndex;
-    playbackInterval.current = setInterval(() => {
-      if (index < loadedDataset.length) {
-        handleData(loadedDataset[index]);
-        setPlaybackIndex(index);
-        index++;
-      } else {
-        stopDatasetPlayback();
-      }
-    }, 10);
-  };
-
-  const startDatasetPlayback = (dataset: SensorData[]) => {
-    if (isSimulating) {
-      if (simulationInterval.current) clearInterval(simulationInterval.current);
-      setIsSimulating(false);
+  const resumeDatasetPlayback = useCallback(() => {
+    const ds =
+      playbackDatasetRef.current.length > 0 ? playbackDatasetRef.current : loadedDataset || [];
+    if (ds.length === 0) return;
+    const resumeFrom =
+      playbackIndexRef.current >= ds.length - 1 ? 0 : playbackIndexRef.current + 1;
+    if (resumeFrom === 0) {
+      uiBuffer.current = [];
+      setData([]);
     }
-    stopDatasetPlayback();
-    setData([]);
-    setPlaybackIndex(0);
-    setIsPlayingDataset(true);
-    setIsPausedDataset(false);
-    setIsConnected(true);
-    setConnectionType('sim');
+    runPlaybackLoop(ds, resumeFrom);
+  }, [loadedDataset, runPlaybackLoop]);
 
-    let index = 0;
-    playbackInterval.current = setInterval(() => {
-      if (index < dataset.length) {
-        handleData(dataset[index]);
-        setPlaybackIndex(index);
-        index++;
-      } else {
-        stopDatasetPlayback();
+  const startDatasetPlayback = useCallback(
+    (
+      dataset: SensorData[],
+      options?: { label?: string | null; strokes?: DrawingStroke[] | null }
+    ) => {
+      if (!dataset || dataset.length === 0) return;
+      if (simulationInterval.current) {
+        clearInterval(simulationInterval.current);
+        simulationInterval.current = null;
+        setIsSimulating(false);
+        if (connectionType === 'sim') {
+          setIsConnected(false);
+          setConnectionType(null);
+        }
       }
-    }, 10);
-  };
+      stopDatasetPlayback();
+      uiBuffer.current = [];
+      setData([]);
+      setLoadedDataset(dataset);
+      if (options && 'label' in options) {
+        setReplayLabel(options.label ?? null);
+      } else {
+        setReplayLabel('Session Replay');
+      }
+      if (options && 'strokes' in options) {
+        setReplayStrokes(options.strokes ?? null);
+      }
+      runPlaybackLoop(dataset, 0);
+    },
+    [connectionType, runPlaybackLoop, stopDatasetPlayback]
+  );
+
+  const clearReplayAndPlayback = useCallback(() => {
+    stopDatasetPlayback();
+    playbackDatasetRef.current = [];
+    playbackIndexRef.current = 0;
+    setPlaybackIndex(0);
+    setLoadedDataset(null);
+    setReplayLabel(null);
+    setReplayStrokes(null);
+    uiBuffer.current = [];
+    sectionDataBuffer.current = [];
+    recordingBuffer.current = [];
+    activeDrawingStrokesRef.current = [];
+    sectionJustSavedRef.current = false;
+    isPausedRealTimeRef.current = false;
+    setIsPausedRealTime(false);
+    isDrawingOnCanvasRef.current = false;
+    setIsDrawingOnCanvas(false);
+    setData([]);
+    setSectionData([]);
+    setCanvasResetNonce((n) => n + 1);
+  }, [stopDatasetPlayback]);
+
+  const handleStopTesting = useCallback(() => {
+    // Capture complete section reading before halting stream
+    const fullSection =
+      sectionDataBuffer.current.length > 0
+        ? [...sectionDataBuffer.current]
+        : sectionData.length > 0
+        ? [...sectionData]
+        : [...data];
+
+    if (simulationInterval.current) {
+      clearInterval(simulationInterval.current);
+      simulationInterval.current = null;
+    }
+
+    uiBuffer.current = [];
+    isDrawingOnCanvasRef.current = false;
+    setIsDrawingOnCanvas(false);
+    setIsRecording(false);
+
+    if (isSimulating || connectionType === 'sim') {
+      setIsSimulating(false);
+      setIsConnected(false);
+      setConnectionType(null);
+      isPausedRealTimeRef.current = false;
+      setIsPausedRealTime(false);
+    } else {
+      // Keep BLE/USB/WiFi/TouchPad hardware connected in standby while testing is stopped
+      isPausedRealTimeRef.current = true;
+      setIsPausedRealTime(true);
+    }
+
+    if (fullSection.length > 0) {
+      setSectionData(fullSection);
+      setLoadedDataset(fullSection);
+      setReplayLabel(isSimulating ? 'Stopped Demo Test' : 'Stopped Test Section');
+    }
+  }, [connectionType, data, isSimulating, sectionData]);
 
   const simSampleCountRef = useRef<number>(0);
 
   const startSimulationWithProfile = useCallback(
     (profile: SimulationProfile) => {
+      stopDatasetPlayback();
+      setLoadedDataset(null);
+      setReplayLabel(null);
+      setReplayStrokes(null);
+      isPausedRealTimeRef.current = false;
+      setIsPausedRealTime(false);
       simProfileRef.current = profile;
       setSimProfile(profile);
       uiBuffer.current = [];
@@ -956,15 +1121,12 @@ function App() {
         handleData(sample);
       }, 20);
     },
-    [handleData]
+    [handleData, stopDatasetPlayback]
   );
 
   const toggleSimulation = () => {
     if (isSimulating) {
-      if (simulationInterval.current) clearInterval(simulationInterval.current);
-      setIsSimulating(false);
-      setIsConnected(false);
-      setConnectionType(null);
+      handleStopTesting();
     } else {
       startSimulationWithProfile(simProfile);
     }
@@ -975,13 +1137,7 @@ function App() {
   };
 
   const clearData = () => {
-    setData([]);
-    setSectionData([]);
-    sectionJustSavedRef.current = false;
-    sectionDataBuffer.current = [];
-    recordingBuffer.current = [];
-    activeDrawingStrokesRef.current = [];
-    setReplayStrokes(null);
+    clearReplayAndPlayback();
   };
 
   const startCalibration = (
@@ -1455,11 +1611,7 @@ function App() {
               <button
                 onClick={() => {
                   setShowPenModal(false);
-                  isDrawingOnCanvasRef.current = false;
-                  setIsDrawingOnCanvas(false);
-                  uiBuffer.current = [];
-                  recordingBuffer.current = [];
-                  setData([]);
+                  clearReplayAndPlayback();
                   setIsConnected(true);
                   setConnectionType('touch');
                   setIsSimulating(false);
@@ -1647,21 +1799,25 @@ function App() {
             <div className="hidden md:flex items-center gap-2 text-xs font-mono text-slate-600 dark:text-slate-400 mr-2">
               <span
                 className={
-                  isConnected
+                  isPlayingDataset
+                    ? 'text-sky-700 dark:text-sky-400 font-semibold'
+                    : isConnected
                     ? 'text-emerald-700 dark:text-emerald-400 font-semibold'
                     : 'text-slate-500 dark:text-slate-400'
                 }
               >
-                {isConnected
+                {isPlayingDataset
+                  ? `● ${isPausedDataset ? 'PLAYBACK PAUSED' : t('playingDataset')}`
+                  : isConnected
                   ? `● ${
-                      isPlayingDataset
-                        ? t('playingDataset')
-                        : isSimulating
+                      isSimulating
                         ? `SIMULATING (${simProfile === 'pd_resting' ? 'PD 4.8Hz' : simProfile === 'et_postural' ? 'ET 8.5Hz' : 'BASELINE'})`
                         : connectionType === 'touch'
                         ? t('touchPadMode')
-                        : connectionType === 'ble'
+                        : connectionType === 'ble' || connectionType === 'ble-touch'
                         ? (bleService.getDeviceName() || 'BLE PEN').toUpperCase()
+                        : connectionType === 'wifi' || connectionType === 'wifi-touch'
+                        ? 'WIFI PEN'
                         : connectionType === 'mobile'
                         ? t('mobileSensors')
                         : t('usbConnected')
@@ -1710,12 +1866,28 @@ function App() {
                 </div>
               )}
 
-            {!isConnected ? (
+            {isPlayingDataset ? (
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={stopDatasetPlayback}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-red-50 text-red-700 border border-red-200 rounded-md hover:bg-red-100 dark:bg-red-950/30 dark:text-red-400 dark:border-red-900/50 transition-colors text-xs font-medium whitespace-nowrap shrink-0"
+                >
+                  <Square size={14} />
+                  <span>{t('stopPlayback')}</span>
+                </button>
+                <button
+                  onClick={clearReplayAndPlayback}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-md hover:bg-amber-100 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800 transition-colors text-xs font-medium whitespace-nowrap shrink-0"
+                >
+                  <Trash2 size={14} />
+                  <span>Clear Replay</span>
+                </button>
+              </div>
+            ) : !isConnected ? (
               <div className="flex flex-wrap items-center gap-1.5">
                 <DatasetUploader
                   onDataLoaded={(dataset) => {
-                    setLoadedDataset(dataset);
-                    startDatasetPlayback(dataset);
+                    startDatasetPlayback(dataset, { label: 'Uploaded Dataset', strokes: null });
                   }}
                   onError={(msg) => setErrorModal({ title: 'Dataset Error', message: msg })}
                 />
@@ -1762,37 +1934,29 @@ function App() {
               </div>
             ) : (
               <div className="flex items-center gap-1.5">
-                {!isPlayingDataset && (
-                  <button
-                    onClick={() => setShowCalibrationModal(true)}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 border rounded-md transition-colors text-xs font-medium whitespace-nowrap shrink-0 ${
-                      isCalibrating
-                        ? 'bg-amber-50 border-amber-300 text-amber-800 dark:bg-amber-950/40 dark:border-amber-800 dark:text-amber-300'
-                        : offsets.ax !== 0 || offsets.gx !== 0 || offsets.mx !== 0
-                        ? 'bg-emerald-50 border-emerald-200 text-emerald-800 dark:bg-emerald-950/40 dark:border-emerald-800 dark:text-emerald-300'
-                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-700'
-                    }`}
-                  >
-                    <Target size={14} className={isCalibrating ? 'animate-spin' : ''} />
-                    <span>
-                      {isCalibrating
-                        ? `${t('calibrating')} (${calibrationTimeLeft}s)`
-                        : t('calibrate')}
-                    </span>
-                  </button>
-                )}
                 <button
-                  onClick={disconnect}
+                  onClick={() => setShowCalibrationModal(true)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 border rounded-md transition-colors text-xs font-medium whitespace-nowrap shrink-0 ${
+                    isCalibrating
+                      ? 'bg-amber-50 border-amber-300 text-amber-800 dark:bg-amber-950/40 dark:border-amber-800 dark:text-amber-300'
+                      : offsets.ax !== 0 || offsets.gx !== 0 || offsets.mx !== 0
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800 dark:bg-emerald-950/40 dark:border-emerald-800 dark:text-emerald-300'
+                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  <Target size={14} className={isCalibrating ? 'animate-spin' : ''} />
+                  <span>
+                    {isCalibrating
+                      ? `${t('calibrating')} (${calibrationTimeLeft}s)`
+                      : t('calibrate')}
+                  </span>
+                </button>
+                <button
+                  onClick={isSimulating ? handleStopTesting : disconnect}
                   className="flex items-center gap-1.5 px-3 py-1.5 bg-red-50 text-red-700 border border-red-200 rounded-md hover:bg-red-100 dark:bg-red-950/30 dark:text-red-400 dark:border-red-900/50 transition-colors text-xs font-medium whitespace-nowrap shrink-0"
                 >
                   <Square size={14} />
-                  <span>
-                    {isPlayingDataset
-                      ? t('stopPlayback')
-                      : isSimulating
-                      ? t('stopDemo')
-                      : t('disconnect')}
-                  </span>
+                  <span>{isSimulating ? t('stopDemo') : t('disconnect')}</span>
                 </button>
               </div>
             )}
@@ -1817,16 +1981,17 @@ function App() {
       <main className="max-w-7xl mx-auto px-4 py-6">
         {isPlayingDataset && loadedDataset && (
           <div className="mb-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-4">
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
               <div>
                 <span className="text-xs font-semibold text-sky-800 dark:text-sky-400 font-mono">
                   {t('datasetPlaybackProgress')}
+                  {replayLabel ? ` · ${replayLabel}` : ''}
                 </span>
                 <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 font-mono tabular-nums">
                   {playbackIndex + 1} / {loadedDataset.length} {t('points')}
                 </div>
               </div>
-              <div className="flex space-x-1.5">
+              <div className="flex flex-wrap gap-1.5">
                 {isPausedDataset ? (
                   <button
                     onClick={resumeDatasetPlayback}
@@ -1851,6 +2016,13 @@ function App() {
                   <Square size={13} />
                   <span>{t('stop')}</span>
                 </button>
+                <button
+                  onClick={clearReplayAndPlayback}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 bg-amber-50 text-amber-800 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800 rounded-md hover:bg-amber-100 transition-colors text-xs font-medium"
+                >
+                  <Trash2 size={13} />
+                  <span>Clear Replay</span>
+                </button>
               </div>
             </div>
             <div className="w-full bg-slate-100 dark:bg-slate-800 h-1.5 rounded-full overflow-hidden">
@@ -1862,21 +2034,17 @@ function App() {
           </div>
         )}
 
-        {isPausedDataset && (
+        {isPausedDataset && loadedDataset && (
           <DatasetSummary
-            data={
-              loadedDataset
-                ? loadedDataset.slice(0, Math.max(12, playbackIndex + 1))
-                : sectionData.length > 0
-                ? sectionData
-                : data
-            }
-            title={t('analysisUntilPause')}
+            data={loadedDataset.slice(
+              0,
+              Math.min(loadedDataset.length, Math.max(12, playbackIndex + 1))
+            )}
+            title={`${t('analysisUntilPause')}${replayLabel ? ` · ${replayLabel}` : ''}`}
+            playLabel={t('resumeAnalysis')}
+            clearLabel="Clear Replay"
             onPlay={resumeDatasetPlayback}
-            onClear={() => {
-              setLoadedDataset(null);
-              stopDatasetPlayback();
-            }}
+            onClear={clearReplayAndPlayback}
             onRequestReport={(sess) => setReportModalSession(sess)}
             isDark={!isHighContrast}
             sensitivityMultiplier={sensitivityMultiplier}
@@ -1886,8 +2054,20 @@ function App() {
         {loadedDataset && !isPlayingDataset && (
           <DatasetSummary
             data={loadedDataset}
-            onPlay={() => startDatasetPlayback(loadedDataset)}
-            onClear={() => setLoadedDataset(null)}
+            title={
+              replayLabel
+                ? `${t('datasetAnalysisSummary')} · ${replayLabel}`
+                : `${t('datasetAnalysisSummary')} (Total Section Average)`
+            }
+            playLabel={t('playSession')}
+            clearLabel="Clear Replay"
+            onPlay={() =>
+              startDatasetPlayback(loadedDataset, {
+                label: replayLabel || 'Session Replay',
+                strokes: replayStrokes,
+              })
+            }
+            onClear={clearReplayAndPlayback}
             onRequestReport={(sess) => setReportModalSession(sess)}
             isDark={!isHighContrast}
             sensitivityMultiplier={sensitivityMultiplier}
@@ -1898,7 +2078,17 @@ function App() {
           <DatasetSummary
             data={sectionData}
             title={`${t('datasetAnalysisSummary')} (Total Section Average)`}
-            onPlay={() => startDatasetPlayback(sectionData)}
+            playLabel={t('playSession')}
+            clearLabel={t('clear')}
+            onPlay={() =>
+              startDatasetPlayback(sectionData, {
+                label: 'Current Section',
+                strokes:
+                  activeDrawingStrokesRef.current.length > 0
+                    ? activeDrawingStrokesRef.current
+                    : null,
+              })
+            }
             onClear={clearData}
             onRequestReport={(sess) => setReportModalSession(sess)}
             isDark={!isHighContrast}
@@ -1906,19 +2096,27 @@ function App() {
           />
         )}
 
-        {isConnected && connectionType !== 'sim' && (
+        {isConnected && !isPlayingDataset && (
           <div className="mb-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <span className="text-xs font-semibold text-sky-800 dark:text-sky-400 font-mono">
-                  {isDrawingOnCanvas
+                  {isPausedRealTime
+                    ? `○ Testing Stopped / Paused · ${sectionData.length || data.length} Total Section Samples`
+                    : isSimulating
+                    ? `● Demo Testing Active (${simProfile === 'pd_resting' ? 'PD 4.8Hz' : simProfile === 'et_postural' ? 'ET 8.5Hz' : 'Baseline'} · ${sectionData.length || data.length} pts)`
+                    : isDrawingOnCanvas
                     ? `● ${t('realtimeAnalysisLive')} (Active Canvas Stroke · ${sectionData.length || data.length} pts)`
                     : sectionData.length > 0
                     ? `○ Section Averaged · ${sectionData.length} Total Section Samples`
                     : '○ Pen Connected · Standby (Start Drawing on Spiral or Free-Draw Canvas Below)'}
                 </span>
                 <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  {isDrawingOnCanvas
+                  {isPausedRealTime
+                    ? 'Testing capture is paused while hardware stays connected. Click Resume, draw on the canvas, or Clear to reset.'
+                    : isSimulating
+                    ? 'Live clinical simulation stream running. Click Stop Analysis to freeze the full section summary or Clear to reset.'
+                    : isDrawingOnCanvas
                     ? `${t('collectingDataFrom')} ${
                         connectionType?.includes('touch')
                           ? t('touchPadAndPen')
@@ -1929,53 +2127,75 @@ function App() {
                     : 'Tremor measurement starts only when you draw on the trackpad spiral or free-draw canvas.'}
                 </div>
               </div>
-              {(sectionData.length > 0 || data.length > 0) && (
-                <div className="flex space-x-1.5">
-                  {isPausedRealTime ? (
-                    <button
-                      onClick={() => setIsPausedRealTime(false)}
-                      className="flex items-center space-x-1.5 px-3 py-1.5 bg-sky-700 hover:bg-sky-800 text-white rounded-md transition-colors text-xs font-medium"
-                    >
-                      <Play size={13} />
-                      <span>{t('resume')}</span>
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => setIsPausedRealTime(true)}
-                      className="flex items-center space-x-1.5 px-3 py-1.5 bg-white text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700 rounded-md hover:bg-slate-50 transition-colors text-xs font-medium"
-                    >
-                      <Pause size={13} />
-                      <span>{t('pause')}</span>
-                    </button>
-                  )}
+              <div className="flex flex-wrap gap-1.5">
+                {isPausedRealTime ? (
                   <button
                     onClick={() => {
+                      isPausedRealTimeRef.current = false;
                       setIsPausedRealTime(false);
-                      const fullSection =
-                        sectionDataBuffer.current.length > 0
-                          ? [...sectionDataBuffer.current]
-                          : sectionData.length > 0
-                          ? [...sectionData]
-                          : [...data];
-                      setLoadedDataset(fullSection);
-                      disconnect();
+                      setLoadedDataset(null);
+                      setReplayLabel(null);
                     }}
-                    className="flex items-center space-x-1.5 px-3 py-1.5 bg-red-50 text-red-700 border border-red-200 dark:bg-red-950/30 dark:text-red-400 dark:border-red-900/50 rounded-md hover:bg-red-100 transition-colors text-xs font-medium"
+                    className="flex items-center space-x-1.5 px-3 py-1.5 bg-sky-700 hover:bg-sky-800 text-white rounded-md transition-colors text-xs font-medium"
                   >
-                    <Square size={13} />
-                    <span>{t('stopAnalysis')}</span>
+                    <Play size={13} />
+                    <span>{t('resume')}</span>
                   </button>
-                </div>
-              )}
+                ) : (
+                  <button
+                    onClick={() => {
+                      isPausedRealTimeRef.current = true;
+                      setIsPausedRealTime(true);
+                    }}
+                    className="flex items-center space-x-1.5 px-3 py-1.5 bg-white text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700 rounded-md hover:bg-slate-50 transition-colors text-xs font-medium"
+                  >
+                    <Pause size={13} />
+                    <span>{t('pause')}</span>
+                  </button>
+                )}
+                <button
+                  onClick={handleStopTesting}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 bg-red-50 text-red-700 border border-red-200 dark:bg-red-950/30 dark:text-red-400 dark:border-red-900/50 rounded-md hover:bg-red-100 transition-colors text-xs font-medium"
+                >
+                  <Square size={13} />
+                  <span>{t('stopAnalysis')}</span>
+                </button>
+                {(sectionData.length > 0 || data.length > 0 || loadedDataset) && (
+                  <button
+                    onClick={clearData}
+                    className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors text-xs font-medium"
+                  >
+                    <Trash2 size={13} />
+                    <span>{t('clear')}</span>
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         )}
 
-        {isConnected && (
+        {(isConnected || (replayStrokes && replayStrokes.length > 0)) && (
           <TouchPadCanvas
             onData={handleData}
             mode={connectionType === 'touch' ? 'touch' : 'combined'}
             onDrawingStateChange={(drawing) => {
+              if (drawing) {
+                // Automatically resume testing & exit replay preview when the user begins a new stroke
+                if (isPlayingDatasetRef.current) {
+                  stopDatasetPlayback();
+                }
+                if (isPausedRealTimeRef.current) {
+                  isPausedRealTimeRef.current = false;
+                  setIsPausedRealTime(false);
+                }
+                if (loadedDataset) {
+                  setLoadedDataset(null);
+                  setReplayLabel(null);
+                }
+                if (replayStrokes) {
+                  setReplayStrokes(null);
+                }
+              }
               isDrawingOnCanvasRef.current = drawing;
               setIsDrawingOnCanvas(drawing);
               if (!drawing && sectionDataBuffer.current.length > 0) {
@@ -1991,6 +2211,9 @@ function App() {
               };
             }}
             replayStrokes={replayStrokes}
+            clearNonce={canvasResetNonce}
+            isReplaying={isPlayingDataset}
+            onClearReplay={clearReplayAndPlayback}
             onClearData={clearData}
             onSaveDrawingSession={handleStopAndSaveRecording}
             isRecording={isRecording}
@@ -2537,12 +2760,14 @@ function App() {
                               </button>
                               <button
                                 onClick={() => {
-                                  if (session.drawingStrokes && session.drawingStrokes.length > 0) {
-                                    setReplayStrokes(session.drawingStrokes);
-                                  }
-                                  setSectionData(session.data);
-                                  setLoadedDataset(session.data);
-                                  startDatasetPlayback(session.data);
+                                  startDatasetPlayback(session.data, {
+                                    label: `Recorded Section S-${sectionNum}`,
+                                    strokes:
+                                      session.drawingStrokes && session.drawingStrokes.length > 0
+                                        ? session.drawingStrokes
+                                        : null,
+                                  });
+                                  window.scrollTo({ top: 0, behavior: 'smooth' });
                                 }}
                                 aria-label={`Replay session ${session.id.slice(0, 6)}`}
                                 className="p-1.5 text-slate-600 hover:text-emerald-700 dark:text-slate-400 dark:hover:text-emerald-400 transition-colors"
