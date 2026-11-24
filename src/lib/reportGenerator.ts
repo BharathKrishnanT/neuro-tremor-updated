@@ -272,7 +272,75 @@ export const generateClinicalReport = (session: Session, patient?: PatientDetail
     }
   }
 
+  // Section 4b: Time-Synchronized 200 Hz Multimodal Fusion Biomarkers (when available)
+  if (session.multimodalFusion) {
+    const mf = session.multimodalFusion;
+    if (currentY > 235) {
+      doc.addPage();
+      currentY = 18;
+    }
+    doc.setFontSize(10.5);
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(15, 23, 42);
+    doc.text(
+      `Time-Synchronized Stroke-Level Multimodal Fusion (${mf.sampleRateHz} Hz · ${mf.totalMatrixRows.toLocaleString()} Synced Rows)`,
+      14,
+      currentY
+    );
+    doc.setLineWidth(0.5);
+    doc.line(14, currentY + 1.8, 196, currentY + 1.8);
+    currentY += 3.5;
+
+    const fusionRows = [
+      [
+        'In-Air Resting Tremor (pen_up)',
+        `${mf.inAirTremor.dominantFreqHz.toFixed(1)} Hz · ${mf.inAirTremor.rmsG.toFixed(3)} g`,
+        `4-6 Hz PD Band: ${mf.inAirTremor.pd4to6Share}% | Duration: ${mf.inAirDurationSec.toFixed(1)}s (${mf.inAirTremor.windowCount} Welch windows)`,
+      ],
+      [
+        'On-Paper Kinetic Tremor (pen_down)',
+        `${mf.onPaperTremor.dominantFreqHz.toFixed(1)} Hz · ${mf.onPaperTremor.rmsG.toFixed(3)} g`,
+        `5-10 Hz Kinetic Band: ${mf.onPaperTremor.kinetic5to10Share}% | Duration: ${mf.onPaperDurationSec.toFixed(1)}s (${mf.penDownRatioPct}% contact)`,
+      ],
+      [
+        'Micrographia & Slowing',
+        `Decay: ${mf.globalMotor.micrographiaDecayPct.toFixed(1)}% | Slowing: ${mf.globalMotor.progressiveSlowingPct.toFixed(1)}%`,
+        `Mean Radial Error: ${mf.globalMotor.meanRadialErrorPx.toFixed(1)} px (RMS ${mf.globalMotor.rmsRadialErrorPx.toFixed(1)} px) | Mean Speed: ${mf.globalMotor.meanVelocityPxS.toFixed(0)} px/s`,
+      ],
+      [
+        'FSR-Velocity Rigidity Coupling',
+        `r = ${mf.rigidityCoupling.fsrVelocityCorrelation.toFixed(2)} | ${mf.rigidityCoupling.coupledSpikeCount} Spike(s)`,
+        `On-Paper FSR: ${mf.rigidityCoupling.meanOnPaperFsr} (Peak ${mf.rigidityCoupling.peakFsr}) | In-Air FSR: ${mf.rigidityCoupling.meanInAirFsr}`,
+      ],
+    ];
+
+    autoTable(doc, {
+      startY: currentY,
+      head: [['Fusion Dimension', 'Measured Value', '200 Hz Post-Completion Clinical Interpretation']],
+      body: fusionRows,
+      theme: 'grid',
+      headStyles: {
+        fillColor: [15, 23, 42],
+        textColor: [255, 255, 255],
+        fontStyle: 'bold',
+        fontSize: 8.0,
+      },
+      bodyStyles: { fontSize: 7.6, cellPadding: 1.4, textColor: [30, 41, 59] },
+      columnStyles: {
+        0: { fontStyle: 'bold', cellWidth: 46 },
+        1: { cellWidth: 46, fontStyle: 'bold' },
+        2: { cellWidth: 90 },
+      },
+    });
+
+    currentY = ((doc as any).lastAutoTable?.finalY ?? currentY + 26) + 4;
+  }
+
   // Section 5: Clinical Impression & Rationale
+  if (currentY > 250) {
+    doc.addPage();
+    currentY = 18;
+  }
   doc.setFontSize(10.5);
   doc.setFont('helvetica', 'bold');
   doc.setTextColor(15, 23, 42);
@@ -285,8 +353,11 @@ export const generateClinicalReport = (session: Session, patient?: PatientDetail
   doc.setFont('helvetica', 'normal');
   doc.setTextColor(51, 65, 85);
 
-  doc.text(diff.clinicalRationale, 14, currentY, { maxWidth: 182 });
-  currentY += 10;
+  const combinedRationale = session.multimodalFusion
+    ? `${diff.clinicalRationale} ${session.multimodalFusion.fusionClinicalSummary}`
+    : diff.clinicalRationale;
+  doc.text(combinedRationale, 14, currentY, { maxWidth: 182 });
+  currentY += session.multimodalFusion ? 16 : 10;
 
   if (patient?.notes) {
     doc.setFont('helvetica', 'bold');

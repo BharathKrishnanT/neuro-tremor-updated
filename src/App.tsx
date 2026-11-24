@@ -15,12 +15,20 @@ import {
   DatasetSectionSummary,
   SensorChannelStats,
 } from './lib/tremorAnalyzer';
+import {
+  MultimodalFusionResult,
+  FusedMatrixRow,
+  RawDigitizerSample,
+  computeMultimodalFusion,
+  generateDemoFusionTick,
+} from './lib/multimodalFusion';
 import { verifyAndCompressSession } from './lib/backendApi';
 import { audioFeedback } from './lib/audio';
 import { exportService } from './lib/exportService';
 import { LiveChart } from './components/LiveChart';
 import { TremorAnalysis } from './components/TremorAnalysis';
 import { DifferentialDiagnosisPanel } from './components/DifferentialDiagnosisPanel';
+import { MultimodalFusionPanel } from './components/MultimodalFusionPanel';
 import { DatasetUploader } from './components/DatasetUploader';
 import { DatasetSummary } from './components/DatasetSummary';
 import { RecoveryTrendChart } from './components/RecoveryTrendChart';
@@ -28,6 +36,7 @@ import {
   TouchPadCanvas,
   DrawingStroke,
   CanvasDrawMode,
+  DigitizerStreamEvent,
   renderDrawingToCanvas,
 } from './components/TouchPadCanvas';
 import { LanguageSelector } from './components/LanguageSelector';
@@ -66,6 +75,8 @@ import {
   Cpu,
   Eye,
   Download,
+  Timer,
+  Layers,
 } from 'lucide-react';
 import { generateClinicalReport } from './lib/reportGenerator';
 import {
@@ -113,6 +124,7 @@ export interface Session {
   analysis?: DifferentialAnalysisResult;
   datasetSummary?: DatasetSectionSummary;
   sensorStats?: SensorChannelStats;
+  multimodalFusion?: MultimodalFusionResult;
   recoveryRate?: number;
   previousSectionRms?: number;
   sectionComparisonLabel?: string;
@@ -123,25 +135,34 @@ export interface Session {
 }
 
 function serializeSessionPayload(session: Session): string {
-  return JSON.stringify({
-    version: 2,
-    frames: session.data,
-    rawSampleCount: session.rawSampleCount ?? session.data.length,
-    drawingStrokes: session.drawingStrokes ?? [],
-    canvasMode: session.canvasMode ?? 'spiral',
-    canvasWidth: session.canvasWidth ?? 800,
-    canvasHeight: session.canvasHeight ?? 320,
-    analysis: session.analysis,
-    datasetSummary: session.datasetSummary,
-    sensorStats: session.sensorStats,
-    recoveryRate: session.recoveryRate,
-    previousSectionRms: session.previousSectionRms,
-    sectionComparisonLabel: session.sectionComparisonLabel,
-    connectionType: session.connectionType ?? null,
-    sensitivity: session.sensitivity,
-    sensitivityMultiplier: session.sensitivityMultiplier,
-    calibrationOffsets: session.calibrationOffsets,
-  });
+  const buildPayload = (frames: SensorData[]) =>
+    JSON.stringify({
+      version: 2,
+      frames,
+      rawSampleCount: session.rawSampleCount ?? session.data.length,
+      drawingStrokes: session.drawingStrokes ?? [],
+      canvasMode: session.canvasMode ?? 'spiral',
+      canvasWidth: session.canvasWidth ?? 800,
+      canvasHeight: session.canvasHeight ?? 320,
+      analysis: session.analysis,
+      datasetSummary: session.datasetSummary,
+      sensorStats: session.sensorStats,
+      multimodalFusion: session.multimodalFusion,
+      recoveryRate: session.recoveryRate,
+      previousSectionRms: session.previousSectionRms,
+      sectionComparisonLabel: session.sectionComparisonLabel,
+      connectionType: session.connectionType ?? null,
+      sensitivity: session.sensitivity,
+      sensitivityMultiplier: session.sensitivityMultiplier,
+      calibrationOffsets: session.calibrationOffsets,
+    });
+
+  const fullStr = buildPayload(session.data);
+  // Guarantee strict conformance to Firestore 1 MB document limit (1,048,576 bytes)
+  if (fullStr.length <= 980000) return fullStr;
+  const stride = Math.max(2, Math.ceil(session.data.length / 400));
+  const compacted = session.data.filter((_, idx) => idx % stride === 0);
+  return buildPayload(compacted);
 }
 
 function deserializeSessionDoc(d: Record<string, any>): Session {
@@ -188,6 +209,7 @@ function deserializeSessionDoc(d: Record<string, any>): Session {
     analysis,
     datasetSummary,
     sensorStats,
+    multimodalFusion: isV2Archive ? parsed.multimodalFusion : d.multimodalFusion,
     recoveryRate: isV2Archive ? parsed.recoveryRate : d.recoveryRate,
     previousSectionRms: isV2Archive ? parsed.previousSectionRms : d.previousSectionRms,
     sectionComparisonLabel: isV2Archive ? parsed.sectionComparisonLabel : d.sectionComparisonLabel,
@@ -314,6 +336,37 @@ function App() {
   const isPlayingDatasetRef = useRef(false);
   const playbackDatasetRef = useRef<SensorData[]>([]);
   const playbackIndexRef = useRef(0);
+
+  // 90-Second Time-Synchronized 200 Hz Multimodal Fusion Controller State
+  const FUSION_TEST_DURATION_SEC = 90;
+  const [isFusionTestActive, setIsFusionTestActive] = useState(false);
+  const [fusionRemainingSec, setFusionRemainingSec] = useState<number>(FUSION_TEST_DURATION_SEC);
+  const [fusionElapsedSec, setFusionElapsedSec] = useState<number>(0);
+  const [fusionPenDown, setFusionPenDown] = useState<0 | 1>(0);
+  const [fusionSignalStats, setFusionSignalStats] = useState<{
+    imuCount: number;
+    digitizerCount: number;
+    quality: 'Nominal' | 'Synthetic' | 'Low Signal';
+  }>({ imuCount: 0, digitizerCount: 0, quality: 'Nominal' });
+  const [fusionResult, setFusionResult] = useState<MultimodalFusionResult | null>(null);
+  const [fusionNotice, setFusionNotice] = useState<string | null>(null);
+  const [demoPenPoint, setDemoPenPoint] = useState<{
+    x: number;
+    y: number;
+    pressure: number;
+    penDown: 0 | 1;
+    t: number;
+  } | null>(null);
+
+  const isFusionTestActiveRef = useRef(false);
+  const fusionStartEpochRef = useRef<number>(0);
+  const fusionSensorBufferRef = useRef<SensorData[]>([]);
+  const fusionDigitizerBufferRef = useRef<RawDigitizerSample[]>([]);
+  const fusionMatrixRef = useRef<FusedMatrixRow[] | null>(null);
+  const fusionTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const demoFusionIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const touchHoverHeartbeatRef = useRef<NodeJS.Timeout | null>(null);
+  const fusionPanelAnchorRef = useRef<HTMLDivElement | null>(null);
   const [offsets, setOffsets] = useState<CalibrationOffsets>(() => {
     try {
       // Clear stale cross-session calibration offsets so sensors always start with true physical units
@@ -642,7 +695,8 @@ function App() {
         return;
       }
 
-      // Gate pen and trackpad connections so tremor measurement only runs while actively drawing on the canvas
+      // Gate pen and trackpad connections so tremor measurement only runs while actively drawing on the canvas,
+      // EXCEPT during an active 90s Multimodal Fusion test where BOTH pen_up (in-air) and pen_down (on-paper) are captured
       const isPenOrTrackpadConnection =
         connectionType === 'ble' ||
         connectionType === 'serial' ||
@@ -652,7 +706,11 @@ function App() {
         connectionType === 'serial-touch' ||
         connectionType === 'wifi-touch';
 
-      if (isPenOrTrackpadConnection && !isDrawingOnCanvasRef.current) {
+      if (
+        isPenOrTrackpadConnection &&
+        !isDrawingOnCanvasRef.current &&
+        !isFusionTestActiveRef.current
+      ) {
         return;
       }
 
@@ -682,6 +740,11 @@ function App() {
       }
 
       uiBuffer.current.push(finalData);
+
+      // Accumulate synchronized raw IMU/FSR frames during an active 90s Multimodal Fusion test (both pen_up & pen_down)
+      if (isFusionTestActiveRef.current && fusionSensorBufferRef.current.length < 15000) {
+        fusionSensorBufferRef.current.push(finalData);
+      }
 
       // If a previous section was just saved, reset the section buffer on the first sample of the next section
       if (sectionJustSavedRef.current) {
@@ -722,7 +785,7 @@ function App() {
         setHasMag(true);
       }
     },
-    [hasGyro, hasMag, isRecording, connectionType, isPlayingDataset]
+    [hasGyro, hasMag, isRecording, connectionType]
   );
 
   useEffect(() => {
@@ -779,6 +842,9 @@ function App() {
 
   useEffect(() => {
     return () => {
+      if (fusionTimerRef.current) clearInterval(fusionTimerRef.current);
+      if (demoFusionIntervalRef.current) clearInterval(demoFusionIntervalRef.current);
+      if (touchHoverHeartbeatRef.current) clearInterval(touchHoverHeartbeatRef.current);
       serialService.disconnect();
       bleService.disconnect();
       mobileSensorService.stop();
@@ -860,6 +926,22 @@ function App() {
   }, []);
 
   const disconnect = async () => {
+    if (fusionTimerRef.current) {
+      clearInterval(fusionTimerRef.current);
+      fusionTimerRef.current = null;
+    }
+    if (demoFusionIntervalRef.current) {
+      clearInterval(demoFusionIntervalRef.current);
+      demoFusionIntervalRef.current = null;
+    }
+    if (touchHoverHeartbeatRef.current) {
+      clearInterval(touchHoverHeartbeatRef.current);
+      touchHoverHeartbeatRef.current = null;
+    }
+    isFusionTestActiveRef.current = false;
+    setIsFusionTestActive(false);
+    setDemoPenPoint(null);
+    setFusionPenDown(0);
     if (connectionType && connectionType.includes('serial')) await serialService.disconnect();
     if (connectionType && connectionType.includes('ble')) await bleService.disconnect();
     if (connectionType && connectionType.includes('wifi')) wifiService.disconnect();
@@ -1024,6 +1106,9 @@ function App() {
     setLoadedDataset(null);
     setReplayLabel(null);
     setReplayStrokes(null);
+    setFusionResult(null);
+    setFusionNotice(null);
+    fusionMatrixRef.current = null;
     uiBuffer.current = [];
     sectionDataBuffer.current = [];
     recordingBuffer.current = [];
@@ -1038,7 +1123,240 @@ function App() {
     setCanvasResetNonce((n) => n + 1);
   }, [stopDatasetPlayback]);
 
+  const stopFusionTimers = useCallback(() => {
+    if (fusionTimerRef.current) {
+      clearInterval(fusionTimerRef.current);
+      fusionTimerRef.current = null;
+    }
+    if (demoFusionIntervalRef.current) {
+      clearInterval(demoFusionIntervalRef.current);
+      demoFusionIntervalRef.current = null;
+    }
+    if (touchHoverHeartbeatRef.current) {
+      clearInterval(touchHoverHeartbeatRef.current);
+      touchHoverHeartbeatRef.current = null;
+    }
+    setDemoPenPoint(null);
+  }, []);
+
+  const handleDigitizerEvent = useCallback((evt: DigitizerStreamEvent) => {
+    setFusionPenDown(evt.penDown);
+    if (!isFusionTestActiveRef.current) return;
+    if (fusionDigitizerBufferRef.current.length < 25000) {
+      fusionDigitizerBufferRef.current.push({
+        tMs: evt.timestamp,
+        x: evt.x,
+        y: evt.y,
+        pressure: evt.pressure,
+        penDown: evt.penDown,
+        mode: evt.mode,
+        canvasWidth: evt.canvasWidth,
+        canvasHeight: evt.canvasHeight,
+      });
+    }
+  }, []);
+
+  const stopAndAnalyzeFusionTest = useCallback(
+    (_reason: 'timer' | 'manual' = 'manual') => {
+      stopFusionTimers();
+      isFusionTestActiveRef.current = false;
+      setIsFusionTestActive(false);
+      isDrawingOnCanvasRef.current = false;
+      setIsDrawingOnCanvas(false);
+
+      if (simulationInterval.current) {
+        clearInterval(simulationInterval.current);
+        simulationInterval.current = null;
+      }
+      if (connectionType === 'sim') {
+        setIsSimulating(false);
+      }
+
+      const endMs = Date.now();
+      const t0Ms = fusionStartEpochRef.current || endMs;
+      const elapsedMs = endMs - t0Ms;
+      const capturedSensors = [...fusionSensorBufferRef.current];
+      const capturedDig = [...fusionDigitizerBufferRef.current];
+
+      if (elapsedMs < 2000 || capturedSensors.length < 10) {
+        setFusionNotice(
+          'At least 2 seconds of synchronized capture is required for post-completion 200 Hz fusion analysis.'
+        );
+        return;
+      }
+
+      const output = computeMultimodalFusion(
+        capturedSensors,
+        capturedDig,
+        activeDrawingStrokesRef.current,
+        t0Ms,
+        endMs,
+        activeCanvasMetaRef.current.mode,
+        activeCanvasMetaRef.current.width,
+        activeCanvasMetaRef.current.height
+      );
+
+      fusionMatrixRef.current = output.matrix;
+      setFusionResult(output.summary);
+      setFusionNotice(null);
+
+      // Freeze section data so Save Fused Section & Dataset Summary reflect the complete trial
+      sectionDataBuffer.current = capturedSensors.slice(-3000);
+      setSectionData(sectionDataBuffer.current);
+      setLoadedDataset(sectionDataBuffer.current);
+      setReplayLabel(`200 Hz Fusion Trial (${output.summary.durationSec.toFixed(1)}s)`);
+
+      audioFeedback.playStopRecording();
+      setTimeout(() => {
+        fusionPanelAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 120);
+    },
+    [connectionType, stopFusionTimers]
+  );
+
+  const cancelFusionTest = useCallback(() => {
+    stopFusionTimers();
+    isFusionTestActiveRef.current = false;
+    setIsFusionTestActive(false);
+    setFusionRemainingSec(FUSION_TEST_DURATION_SEC);
+    setFusionElapsedSec(0);
+    setFusionPenDown(0);
+    setFusionNotice(null);
+    fusionSensorBufferRef.current = [];
+    fusionDigitizerBufferRef.current = [];
+    if (connectionType === 'sim') {
+      if (simulationInterval.current) {
+        clearInterval(simulationInterval.current);
+        simulationInterval.current = null;
+      }
+      setIsSimulating(false);
+      setIsConnected(false);
+      setConnectionType(null);
+    }
+  }, [connectionType, stopFusionTimers]);
+
+  const startFusionTest = useCallback(
+    (forceDemo: boolean = false) => {
+      stopFusionTimers();
+      clearReplayAndPlayback();
+
+      const t0 = Date.now();
+      fusionStartEpochRef.current = t0;
+      fusionSensorBufferRef.current = [];
+      fusionDigitizerBufferRef.current = [];
+      fusionMatrixRef.current = null;
+      setFusionResult(null);
+      setFusionNotice(null);
+      setFusionRemainingSec(FUSION_TEST_DURATION_SEC);
+      setFusionElapsedSec(0);
+      setFusionPenDown(0);
+      isFusionTestActiveRef.current = true;
+      setIsFusionTestActive(true);
+      audioFeedback.playStartRecording();
+
+      const useDemoMode = forceDemo || !isConnected || isSimulating || connectionType === 'sim';
+
+      if (useDemoMode) {
+        if (simulationInterval.current) {
+          clearInterval(simulationInterval.current);
+          simulationInterval.current = null;
+        }
+        setIsConnected(true);
+        setConnectionType('sim');
+        setIsSimulating(true);
+        activeCanvasMetaRef.current = { mode: 'spiral', width: 800, height: 320 };
+
+        demoFusionIntervalRef.current = setInterval(() => {
+          if (!isFusionTestActiveRef.current) return;
+          const now = Date.now();
+          const elapsed = (now - fusionStartEpochRef.current) / 1000;
+          const tick = generateDemoFusionTick(elapsed, simProfileRef.current, now, 800, 320);
+
+          // Push directly to fusion buffers + UI stream
+          fusionSensorBufferRef.current.push(tick.sensor);
+          fusionDigitizerBufferRef.current.push(tick.digitizer);
+          uiBuffer.current.push(tick.sensor);
+          if (sectionDataBuffer.current.length < 3000) {
+            sectionDataBuffer.current.push(tick.sensor);
+          }
+          setFusionPenDown(tick.digitizer.penDown);
+          setDemoPenPoint({
+            x: tick.digitizer.x,
+            y: tick.digitizer.y,
+            pressure: tick.digitizer.pressure,
+            penDown: tick.digitizer.penDown,
+            t: now,
+          });
+        }, 20);
+      } else if (connectionType === 'touch') {
+        // In trackpad-only mode, emit subtle baseline in-air resting samples while lifted so pen_up intervals populate
+        touchHoverHeartbeatRef.current = setInterval(() => {
+          if (!isFusionTestActiveRef.current || isDrawingOnCanvasRef.current) return;
+          const now = Date.now();
+          const elapsed = (now - fusionStartEpochRef.current) / 1000;
+          const quietInAir = enrichSensorFrame({
+            ax: 0.08 * Math.sin(2 * Math.PI * 4.8 * elapsed),
+            ay: 0.06 * Math.cos(2 * Math.PI * 4.8 * elapsed),
+            az: 9.80665,
+            gx: 1.4 * Math.sin(2 * Math.PI * 4.8 * elapsed),
+            gy: -1.1 * Math.cos(2 * Math.PI * 4.8 * elapsed),
+            gz: 0.4,
+            mx: 28.5,
+            my: -12.4,
+            mz: 36.2,
+            fsr: 0,
+            timestamp: now,
+          });
+          fusionSensorBufferRef.current.push(quietInAir);
+          uiBuffer.current.push(quietInAir);
+          if (sectionDataBuffer.current.length < 3000) {
+            sectionDataBuffer.current.push(quietInAir);
+          }
+        }, 40);
+      }
+
+      fusionTimerRef.current = setInterval(() => {
+        if (!isFusionTestActiveRef.current) return;
+        const elapsed = (Date.now() - fusionStartEpochRef.current) / 1000;
+        const remaining = Math.max(0, FUSION_TEST_DURATION_SEC - elapsed);
+        setFusionElapsedSec(elapsed);
+        setFusionRemainingSec(remaining);
+        setFusionSignalStats({
+          imuCount: fusionSensorBufferRef.current.length,
+          digitizerCount: fusionDigitizerBufferRef.current.length,
+          quality: useDemoMode
+            ? 'Synthetic'
+            : fusionSensorBufferRef.current.length / Math.max(1, elapsed) >= 15
+            ? 'Nominal'
+            : 'Low Signal',
+        });
+
+        if (elapsed >= FUSION_TEST_DURATION_SEC) {
+          stopAndAnalyzeFusionTest('timer');
+        }
+      }, 250);
+    },
+    [
+      clearReplayAndPlayback,
+      connectionType,
+      isConnected,
+      isSimulating,
+      stopAndAnalyzeFusionTest,
+      stopFusionTimers,
+    ]
+  );
+
+  useEffect(() => {
+    return () => {
+      stopFusionTimers();
+    };
+  }, [stopFusionTimers]);
+
   const handleStopTesting = useCallback(() => {
+    if (isFusionTestActiveRef.current) {
+      stopAndAnalyzeFusionTest('manual');
+      return;
+    }
     // Capture complete section reading before halting stream
     const fullSection =
       sectionDataBuffer.current.length > 0
@@ -1074,7 +1392,7 @@ function App() {
       setLoadedDataset(fullSection);
       setReplayLabel(isSimulating ? 'Stopped Demo Test' : 'Stopped Test Section');
     }
-  }, [connectionType, data, isSimulating, sectionData]);
+  }, [connectionType, data, isSimulating, sectionData, stopAndAnalyzeFusionTest]);
 
   const simSampleCountRef = useRef<number>(0);
 
@@ -1463,6 +1781,7 @@ function App() {
       analysis: diffAnalysis,
       datasetSummary,
       sensorStats,
+      multimodalFusion: fusionResult ?? undefined,
       recoveryRate: sequentialRecoveryRate,
       previousSectionRms,
       sectionComparisonLabel,
@@ -2174,10 +2493,115 @@ function App() {
           </div>
         )}
 
+        {/* 90-Second Time-Synchronized 200 Hz Multimodal Fusion Test Bar */}
+        {!isPlayingDataset && (
+          <div className="mb-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="flex flex-wrap items-center gap-2 text-xs font-mono tabular-nums">
+                  <Layers size={14} className="text-sky-700 dark:text-sky-400" />
+                  <span className="font-semibold text-slate-900 dark:text-slate-100 font-sans">
+                    Time-Synchronized Stroke-Level Multimodal Fusion (200 Hz)
+                  </span>
+                  <span aria-hidden="true" className="text-slate-400">
+                    ·
+                  </span>
+                  {isFusionTestActive ? (
+                    <span className="font-semibold text-sky-700 dark:text-sky-400">
+                      ● {String(Math.floor(fusionRemainingSec / 60)).padStart(2, '0')}:
+                      {String(Math.floor(fusionRemainingSec % 60)).padStart(2, '0')} remaining ·{' '}
+                      {fusionPenDown === 1 ? 'On-Paper (pen_down)' : 'In-Air Rest (pen_up)'}
+                    </span>
+                  ) : fusionResult ? (
+                    <span className="text-emerald-700 dark:text-emerald-400 font-medium">
+                      ● Analysis Ready ({fusionResult.totalMatrixRows.toLocaleString()} rows @ 200 Hz)
+                    </span>
+                  ) : (
+                    <span className="text-slate-500 dark:text-slate-400">
+                      ○ 90s Dual-Stream Test Standby (t = 0 Timeline)
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                  {isFusionTestActive
+                    ? `Capturing both pen_up (4–6 Hz rest) & pen_down (5–10 Hz kinetic) streams · IMU: ${fusionSignalStats.imuCount} pts · Digitizer: ${fusionSignalStats.digitizerCount} pts · Signal: ${fusionSignalStats.quality}`
+                    : 'Aligns digitizer strokes with 9-axis IMU + FSR grip onto a 200 Hz 17-channel matrix and runs full 2–4s Welch FFT & rigidity-velocity coupling immediately on completion.'}
+                </p>
+                {fusionNotice && (
+                  <p className="text-xs text-amber-700 dark:text-amber-400 mt-1 font-medium">
+                    ▲ {fusionNotice}
+                  </p>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {!isFusionTestActive ? (
+                  <>
+                    {isConnected ? (
+                      <button
+                        type="button"
+                        onClick={() => startFusionTest(false)}
+                        className="flex items-center gap-1.5 px-3.5 py-1.5 bg-sky-700 hover:bg-sky-800 text-white rounded-md transition-colors text-xs font-semibold whitespace-nowrap shrink-0"
+                      >
+                        <Timer size={13} />
+                        <span>Start 90s Fusion Test</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => startFusionTest(true)}
+                        className="flex items-center gap-1.5 px-3.5 py-1.5 bg-sky-700 hover:bg-sky-800 text-white rounded-md transition-colors text-xs font-semibold whitespace-nowrap shrink-0"
+                        title="Launch a realistic 90-second Demo spiral + in-air pause multimodal fusion test"
+                      >
+                        <Timer size={13} />
+                        <span>Run 90s Demo Fusion Test</span>
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => stopAndAnalyzeFusionTest('manual')}
+                      disabled={fusionElapsedSec < 2}
+                      className="flex items-center gap-1.5 px-3.5 py-1.5 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-45 disabled:cursor-not-allowed text-white rounded-md transition-colors text-xs font-semibold whitespace-nowrap shrink-0"
+                      title="Stop early and immediately run 200 Hz post-completion multimodal fusion"
+                    >
+                      <Square size={12} className="fill-current" />
+                      <span>Stop & Analyze</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={cancelFusionTest}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 rounded-md transition-colors text-xs font-medium whitespace-nowrap shrink-0"
+                    >
+                      <span>Cancel</span>
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {isFusionTestActive && (
+              <div className="mt-3 w-full bg-slate-100 dark:bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                <div
+                  className="bg-sky-600 h-full transition-all duration-200"
+                  style={{
+                    width: `${Math.min(100, (fusionElapsedSec / FUSION_TEST_DURATION_SEC) * 100)}%`,
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        )}
+
         {(isConnected || (replayStrokes && replayStrokes.length > 0)) && (
           <TouchPadCanvas
             onData={handleData}
             mode={connectionType === 'touch' ? 'touch' : 'combined'}
+            onDigitizerEvent={handleDigitizerEvent}
+            isFusionTestActive={isFusionTestActive}
+            externalPenPoint={demoPenPoint}
             onDrawingStateChange={(drawing) => {
               if (drawing) {
                 // Automatically resume testing & exit replay preview when the user begins a new stroke
@@ -2188,7 +2612,7 @@ function App() {
                   isPausedRealTimeRef.current = false;
                   setIsPausedRealTime(false);
                 }
-                if (loadedDataset) {
+                if (loadedDataset && !isFusionTestActiveRef.current) {
                   setLoadedDataset(null);
                   setReplayLabel(null);
                 }
@@ -2240,6 +2664,24 @@ function App() {
             }}
           />
         )}
+
+        {/* Post-Completion 200 Hz Multimodal Fusion Summary Workbench */}
+        <div ref={fusionPanelAnchorRef}>
+          {fusionResult && (
+            <MultimodalFusionPanel
+              result={fusionResult}
+              matrix={fusionMatrixRef.current}
+              isDark={!isHighContrast}
+              onSaveFusedSection={handleStopAndSaveRecording}
+              canSave={sectionData.length >= 12 || data.length >= 12}
+              onClearFusion={() => {
+                setFusionResult(null);
+                fusionMatrixRef.current = null;
+                setFusionNotice(null);
+              }}
+            />
+          )}
+        </div>
 
         {/* Primary 4-Column Kinematic KPI Strip */}
         <TremorAnalysis metrics={metrics} />
@@ -2760,6 +3202,12 @@ function App() {
                               </button>
                               <button
                                 onClick={() => {
+                                  if (session.multimodalFusion) {
+                                    setFusionResult(session.multimodalFusion);
+                                    fusionMatrixRef.current = null;
+                                  } else {
+                                    setFusionResult(null);
+                                  }
                                   startDatasetPlayback(session.data, {
                                     label: `Recorded Section S-${sectionNum}`,
                                     strokes:
@@ -3163,6 +3611,69 @@ function App() {
                                 ))}
                               </div>
                             </div>
+
+                            {/* 5. Saved 200 Hz Multimodal Fusion Summary (if recorded with fusion) */}
+                            {session.multimodalFusion && (
+                              <div className="pt-3 border-t border-slate-200 dark:border-slate-800 space-y-2.5">
+                                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                    Saved 200 Hz Stroke-Level Multimodal Fusion Summary
+                                  </span>
+                                  <span className="font-mono text-[11px] text-slate-500">
+                                    {session.multimodalFusion.totalMatrixRows.toLocaleString()} rows @{' '}
+                                    {session.multimodalFusion.sampleRateHz} Hz · On-Paper{' '}
+                                    {session.multimodalFusion.penDownRatioPct}%
+                                  </span>
+                                </div>
+                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 font-mono text-[11px] tabular-nums">
+                                  <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                    <div className="font-sans text-slate-500">In-Air Rest (pen_up)</div>
+                                    <div className="font-bold text-sky-700 dark:text-sky-400">
+                                      {session.multimodalFusion.inAirTremor.dominantFreqHz.toFixed(1)} Hz ·{' '}
+                                      {session.multimodalFusion.inAirTremor.rmsG.toFixed(3)} g
+                                    </div>
+                                    <div className="text-[10px] text-slate-500">
+                                      4–6 Hz PD: {session.multimodalFusion.inAirTremor.pd4to6Share}% ·{' '}
+                                      {session.multimodalFusion.inAirDurationSec.toFixed(1)}s
+                                    </div>
+                                  </div>
+                                  <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                    <div className="font-sans text-slate-500">On-Paper Kinetic (pen_down)</div>
+                                    <div className="font-bold text-amber-700 dark:text-amber-400">
+                                      {session.multimodalFusion.onPaperTremor.dominantFreqHz.toFixed(1)} Hz ·{' '}
+                                      {session.multimodalFusion.onPaperTremor.rmsG.toFixed(3)} g
+                                    </div>
+                                    <div className="text-[10px] text-slate-500">
+                                      5–10 Hz: {session.multimodalFusion.onPaperTremor.kinetic5to10Share}% ·{' '}
+                                      {session.multimodalFusion.onPaperDurationSec.toFixed(1)}s
+                                    </div>
+                                  </div>
+                                  <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                    <div className="font-sans text-slate-500">Micrographia & Slowing</div>
+                                    <div className="font-bold text-slate-900 dark:text-slate-100">
+                                      {session.multimodalFusion.globalMotor.micrographiaDecayPct.toFixed(1)}% /{' '}
+                                      {session.multimodalFusion.globalMotor.progressiveSlowingPct.toFixed(1)}%
+                                    </div>
+                                    <div className="text-[10px] text-slate-500">
+                                      Radial Err: {session.multimodalFusion.globalMotor.meanRadialErrorPx.toFixed(1)} px
+                                    </div>
+                                  </div>
+                                  <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                                    <div className="font-sans text-slate-500">FSR–Velocity Coupling</div>
+                                    <div className="font-bold text-slate-900 dark:text-slate-100">
+                                      r = {session.multimodalFusion.rigidityCoupling.fsrVelocityCorrelation.toFixed(2)} ·{' '}
+                                      {session.multimodalFusion.rigidityCoupling.coupledSpikeCount} Spikes
+                                    </div>
+                                    <div className="text-[10px] text-slate-500">
+                                      On-Paper FSR: {session.multimodalFusion.rigidityCoupling.meanOnPaperFsr}
+                                    </div>
+                                  </div>
+                                </div>
+                                <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
+                                  {session.multimodalFusion.fusionClinicalSummary}
+                                </p>
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>

@@ -19,10 +19,22 @@ export interface DrawingStroke {
   canvasHeight: number;
 }
 
+export interface DigitizerStreamEvent {
+  x: number;
+  y: number;
+  pressure: number;
+  penDown: 0 | 1;
+  mode: CanvasDrawMode;
+  canvasWidth: number;
+  canvasHeight: number;
+  timestamp: number;
+}
+
 export interface TouchPadCanvasProps {
   onData: (data: SensorData) => void;
   mode?: 'touch' | 'combined';
   onTouchUpdate?: (x: number, y: number, pressure: number, syntheticFrame?: SensorData) => void;
+  onDigitizerEvent?: (evt: DigitizerStreamEvent) => void;
   onDrawingStateChange?: (isDrawing: boolean) => void;
   onStrokesChange?: (
     strokes: DrawingStroke[],
@@ -33,6 +45,8 @@ export interface TouchPadCanvasProps {
   replayStrokes?: DrawingStroke[] | null;
   clearNonce?: number;
   isReplaying?: boolean;
+  isFusionTestActive?: boolean;
+  externalPenPoint?: { x: number; y: number; pressure: number; penDown: 0 | 1; t: number } | null;
   onClearReplay?: () => void;
   onClearData?: () => void;
   onSaveDrawingSession?: () => void;
@@ -133,11 +147,14 @@ export function TouchPadCanvas({
   onData,
   mode = 'touch',
   onTouchUpdate,
+  onDigitizerEvent,
   onDrawingStateChange,
   onStrokesChange,
   replayStrokes,
   clearNonce = 0,
   isReplaying = false,
+  isFusionTestActive = false,
+  externalPenPoint = null,
   onClearReplay,
   onClearData,
   onSaveDrawingSession,
@@ -155,6 +172,7 @@ export function TouchPadCanvas({
   const strokesRef = useRef<DrawingStroke[]>([]);
   const hadReplayRef = useRef<boolean>(false);
   const currentStrokeRef = useRef<DrawingStroke | null>(null);
+  const extStrokeRef = useRef<DrawingStroke | null>(null);
   const lastPos = useRef<{ x: number; y: number; t: number } | null>(null);
   const lastVel = useRef<{ vx: number; vy: number; ax: number; ay: number } | null>(null);
 
@@ -194,11 +212,68 @@ export function TouchPadCanvas({
       hadReplayRef.current = false;
       strokesRef.current = [];
       currentStrokeRef.current = null;
+      extStrokeRef.current = null;
       setIsDrawing(false);
       setHasDrawn(false);
       redrawAll(canvasMode, []);
     }
   }, [clearNonce, canvasMode, redrawAll]);
+
+  // Trace live external demo fusion points onto the canvas during 90s Demo Fusion Test
+  useEffect(() => {
+    if (!externalPenPoint) {
+      extStrokeRef.current = null;
+      return;
+    }
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (!canvas || !ctx) return;
+
+    const scaleX = canvas.width / 800;
+    const scaleY = canvas.height / 320;
+    const px = externalPenPoint.x * scaleX;
+    const py = externalPenPoint.y * scaleY;
+
+    if (externalPenPoint.penDown === 1) {
+      setHasDrawn(true);
+      if (!extStrokeRef.current) {
+        const s: DrawingStroke = {
+          mode: 'spiral',
+          canvasWidth: canvas.width,
+          canvasHeight: canvas.height,
+          points: [
+            {
+              x: Number(px.toFixed(1)),
+              y: Number(py.toFixed(1)),
+              pressure: Math.round(externalPenPoint.pressure),
+              t: externalPenPoint.t,
+            },
+          ],
+        };
+        extStrokeRef.current = s;
+        strokesRef.current = [...strokesRef.current, s];
+      } else {
+        const prev = extStrokeRef.current.points[extStrokeRef.current.points.length - 1];
+        extStrokeRef.current.points.push({
+          x: Number(px.toFixed(1)),
+          y: Number(py.toFixed(1)),
+          pressure: Math.round(externalPenPoint.pressure),
+          t: externalPenPoint.t,
+        });
+        ctx.beginPath();
+        ctx.moveTo(prev.x, prev.y);
+        ctx.lineTo(px, py);
+        ctx.strokeStyle = '#10b981';
+        ctx.lineWidth = 2.2;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.stroke();
+      }
+      onStrokesChange?.(strokesRef.current, 'spiral', canvas.width, canvas.height);
+    } else {
+      extStrokeRef.current = null;
+    }
+  }, [externalPenPoint, onStrokesChange]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -293,6 +368,16 @@ export function TouchPadCanvas({
     };
     currentStrokeRef.current = newStroke;
     strokesRef.current = [...strokesRef.current, newStroke];
+    onDigitizerEvent?.({
+      x: Number(x.toFixed(1)),
+      y: Number(y.toFixed(1)),
+      pressure: Math.round(pressure),
+      penDown: 1,
+      mode: canvasMode,
+      canvasWidth: canvas?.width || 800,
+      canvasHeight: canvas?.height || 320,
+      timestamp: now,
+    });
     onStrokesChange?.(
       strokesRef.current,
       canvasMode,
@@ -307,7 +392,25 @@ export function TouchPadCanvas({
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isDrawing || !lastPos.current || !lastVel.current) return;
+    // When 90s multimodal fusion test is active, stream hover coordinates as pen_up (0)
+    if (!isDrawing) {
+      if (isFusionTestActive && onDigitizerEvent) {
+        const canvas = canvasRef.current;
+        const { x, y } = getCanvasCoordinates(e);
+        onDigitizerEvent({
+          x: Number(x.toFixed(1)),
+          y: Number(y.toFixed(1)),
+          pressure: 0,
+          penDown: 0,
+          mode: canvasMode,
+          canvasWidth: canvas?.width || 800,
+          canvasHeight: canvas?.height || 320,
+          timestamp: Date.now(),
+        });
+      }
+      return;
+    }
+    if (!lastPos.current || !lastVel.current) return;
 
     const now = Date.now();
     const dt = (now - lastPos.current.t) / 1000;
@@ -345,6 +448,16 @@ export function TouchPadCanvas({
         t: now,
       });
       const canvas = canvasRef.current;
+      onDigitizerEvent?.({
+        x: Number(x.toFixed(1)),
+        y: Number(y.toFixed(1)),
+        pressure: Math.round(pressure),
+        penDown: 1,
+        mode: canvasMode,
+        canvasWidth: canvas?.width || 800,
+        canvasHeight: canvas?.height || 320,
+        timestamp: now,
+      });
       onStrokesChange?.(
         strokesRef.current,
         canvasMode,
@@ -395,9 +508,21 @@ export function TouchPadCanvas({
 
   const stopDrawingStroke = () => {
     if (isDrawing) {
+      const canvas = canvasRef.current;
+      const lastPt =
+        currentStrokeRef.current?.points[currentStrokeRef.current.points.length - 1] ?? null;
+      onDigitizerEvent?.({
+        x: lastPt ? lastPt.x : (canvas?.width || 800) / 2,
+        y: lastPt ? lastPt.y : (canvas?.height || 320) / 2,
+        pressure: 0,
+        penDown: 0,
+        mode: canvasMode,
+        canvasWidth: canvas?.width || 800,
+        canvasHeight: canvas?.height || 320,
+        timestamp: Date.now(),
+      });
       setIsDrawing(false);
       onDrawingStateChange?.(false);
-      const canvas = canvasRef.current;
       onStrokesChange?.(
         strokesRef.current,
         canvasMode,
@@ -438,6 +563,10 @@ export function TouchPadCanvas({
             >
               {isReplaying || (replayStrokes && replayStrokes.length > 0)
                 ? `● Replay Preview (${strokesRef.current.length} saved ${strokesRef.current.length === 1 ? 'stroke' : 'strokes'})`
+                : isFusionTestActive
+                ? isDrawing || externalPenPoint?.penDown === 1
+                  ? `● 90s Fusion Active · On-Paper (pen_down = 1 · ${sampleCount} pts)`
+                  : `○ 90s Fusion Active · In-Air Resting (pen_up = 0 · ${sampleCount} pts)`
                 : isDrawing
                 ? `● Measuring Active Stroke (${sampleCount} pts)`
                 : sampleCount > 0
@@ -448,6 +577,8 @@ export function TouchPadCanvas({
           <p className="text-slate-500 dark:text-slate-400 text-xs mt-0.5">
             {isReplaying || (replayStrokes && replayStrokes.length > 0)
               ? 'Showing replayed session drawing. Click Clear Replay to reset the canvas and return to live testing.'
+              : isFusionTestActive
+              ? 'Dual-stream t = 0 fusion active: capturing both in-air resting tremor (pen_up) and on-paper kinetic strokes (pen_down) for 200 Hz post-completion analysis.'
               : 'Tremor measurement activates strictly while you draw on the trackpad canvas below and pauses when the pen lifts.'}
           </p>
         </div>
